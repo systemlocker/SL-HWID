@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>SLHwid</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>System Locker</Authors>
+    <Description>Fault-tolerant, cross-platform hardware fingerprint — 14 hardware factors by default, any two can fail without changing the identifier.</Description>
+    <PackageProjectUrl>https://github.com/systemlocker/SL-HWID</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/systemlocker/SL-HWID</RepositoryUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+</Project>
