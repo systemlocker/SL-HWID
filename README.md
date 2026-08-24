@@ -22,7 +22,7 @@ that share the same on-disk state format:
 - [`csharp/`](csharp/) — .NET 8 library, zero NuGet dependencies.
   Windows, macOS, Linux.
 
-Both are released under the [MIT License](LICENSE).
+Both are released under the [Elastic License v2 license](LICENSE).
 
 ## C++ quickstart
 
