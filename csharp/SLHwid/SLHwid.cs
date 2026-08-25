@@ -161,17 +161,17 @@ public static class SLHwid
     internal static SLHwidSession PrepareWith(SLHwidOptions options,
         Func<Dictionary<string, string>> collect, Func<int, byte[]> source, ISSStore? store)
     {
-        var mandatory = new HashSet<string> { "slstore" };
+        var requestedMandatory = new HashSet<string> { "slstore" };
         foreach (var name in options.ExtraMandatory)
         {
             if (!SlotNamePattern.IsMatch(name))
             {
                 throw new InvalidOperationException($"slhwid: invalid extra mandatory slot name '{name}'");
             }
-            mandatory.Add(name);
+            requestedMandatory.Add(name);
         }
 
-        var factors = SLHwidCore.NormalizeFactors(collect());
+        var rawFactors = SLHwidCore.NormalizeFactors(collect());
         store ??= SLHwidStore.CreateDefault(options.StorePath);
         using var storageLock = SLHwidStore.AcquireLock(store);
         var existing = store.ReadHelper();
@@ -180,21 +180,23 @@ public static class SLHwid
         // injects the persisted value (read-only). An absent value with an
         // existing helper is intentional tampering and RecoverCore reports
         // it as a hard-locked mandatory failure below.
-        if (existing is not null && !options.ForceReenroll && !factors.ContainsKey("slstore"))
+        if (existing is not null && !options.ForceReenroll && !rawFactors.ContainsKey("slstore"))
         {
             var value = store.ReadSlstore();
             if (value is not null)
             {
-                factors["slstore"] = Convert.ToHexString(value).ToLowerInvariant();
+                rawFactors["slstore"] = Convert.ToHexString(value).ToLowerInvariant();
             }
         }
 
         if (existing is null || options.ForceReenroll)
         {
-            if (!factors.ContainsKey("slstore"))
+            if (!rawFactors.ContainsKey("slstore"))
             {
-                factors["slstore"] = EnsureSlstore(store, source);
+                rawFactors["slstore"] = EnsureSlstore(store, source);
             }
+            var factors = SLHwidCore.ProjectFactors(rawFactors, SLHwidCore.CurrentNormVersion);
+            var mandatory = SLHwidCore.MapMandatoryToCurrent(requestedMandatory);
             foreach (var name in mandatory.Order())
             {
                 if (!factors.TryGetValue(name, out var value) || value.Length == 0)
@@ -214,7 +216,17 @@ public static class SLHwid
                 k, new Draw(source), factors, mandatory, store, blob);
         }
 
-        var result = SLHwidCore.RecoverCore(existing, factors);
+        SLHwidCore.Helper helper;
+        try
+        {
+            helper = SLHwidCore.ParseHelper(existing);
+        }
+        catch (SecretSharingCorruptException)
+        {
+            throw new SLHwidCorruptDataException("slhwid: stored helper data is corrupt; re-enroll to recover");
+        }
+        var recoveryFactors = SLHwidCore.ProjectFactors(rawFactors, helper.NormVersion);
+        var result = SLHwidCore.RecoverCore(existing, recoveryFactors);
         if (!result.Ok)
         {
             if (result.Reason == "corrupt")
@@ -225,12 +237,11 @@ public static class SLHwid
         }
         // Do not let another application weaken hard locks selected by the
         // application that enrolled the shared device helper.
-        var storedMandatory = SLHwidCore.ParseHelper(existing)
-            .Slots.Where(slot => slot.Mandatory)
-            .Select(slot => slot.Name)
-            .ToHashSet(StringComparer.Ordinal);
+        var storedMandatory = SLHwidCore.MapMandatoryToCurrent(
+            helper.Slots.Where(slot => slot.Mandatory).Select(slot => slot.Name));
+        var currentFactors = SLHwidCore.ProjectFactors(rawFactors, SLHwidCore.CurrentNormVersion);
         return new SLHwidSession(result.Hwid, false, result.Dead, result.Pending,
-            result.Key!, new Draw(source), factors, storedMandatory, store, existing);
+            result.Key!, new Draw(source), currentFactors, storedMandatory, store, existing);
     }
 
     private static string EnsureSlstore(ISSStore store, Func<int, byte[]> source)

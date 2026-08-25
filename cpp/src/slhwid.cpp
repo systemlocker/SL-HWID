@@ -344,10 +344,12 @@ namespace slhwid::detail
 
     int threshold(int n, int m)
     {
-        if (n < 5 || m >= n)
+        if (n < kMinimumFactors || m >= n)
             return 0;
-        const int num = n > 10 ? 4 : 7; // 80% above ten factors, else 70%
-        const int den = n > 10 ? 5 : 10;
+        // Keep the full percentage policy explicit even though the current
+        // minimum means valid new/current helpers start on the 70% branch.
+        const int num = n < 8 ? 4 : 7;
+        const int den = n < 8 ? 5 : 10;
         int t = (num * n + den - 1) / den;
         if (t < m + 1)
             t = m + 1;
@@ -388,7 +390,7 @@ namespace slhwid::detail
         std::transform(value.begin(), value.end(), value.begin(),
                        [](unsigned char c)
                        { return static_cast<char>(std::tolower(c)); });
-        if (name == "mac")
+        if (name == "mac" || name == "nic_identity")
             value.erase(std::remove_if(value.begin(), value.end(),
                                        [](char c)
                                        { return c == ':' || c == '-'; }),
@@ -410,6 +412,122 @@ namespace slhwid::detail
             if (!normalized.empty() && !isMissing(normalized))
                 out[name] = normalized;
         }
+        return out;
+    }
+
+    namespace
+    {
+        const std::vector<std::string> &legacyFactorNames()
+        {
+            static const std::vector<std::string> names = {
+                "slstore", "machine_guid", "product_uuid", "board_serial", "cpu_id", "disk_serial", "mac",
+                "ram_total", "volume_id", "computer_name", "firmware", "gpu_id", "monitor_edid", "os_build"};
+            return names;
+        }
+
+        const std::vector<std::string> &currentDirectFactorNames()
+        {
+            static const std::vector<std::string> names = {
+                "slstore", "machine_guid", "cpu_id", "disk_serial", "ram_total", "volume_id", "firmware",
+                "tpm_ek", "memory_modules", "nic_identity", "battery_serial"};
+            return names;
+        }
+
+        struct FactorGroup
+        {
+            const char *name;
+            std::vector<std::string> members;
+        };
+
+        const std::vector<FactorGroup> &currentFactorGroups()
+        {
+            static const std::vector<FactorGroup> groups = {
+                {"platform_identity", {"system_uuid", "board_serial", "system_serial", "chassis_serial"}},
+                {"display_group", {"gpu_id", "monitor_edid"}},
+                {"software_environment", {"computer_name", "os_build"}}};
+            return groups;
+        }
+
+        std::string groupValue(const FactorGroup &group, const std::map<std::string, std::string> &raw)
+        {
+            std::vector<unsigned char> encoded;
+            const std::string domain = "SL-HWID-GROUP2";
+            encoded.insert(encoded.end(), domain.begin(), domain.end());
+            encoded.push_back(0);
+            encoded.insert(encoded.end(), group.name, group.name + std::strlen(group.name));
+            encoded.push_back(0);
+            bool present = false;
+            for (const auto &member : group.members)
+            {
+                encoded.insert(encoded.end(), member.begin(), member.end());
+                encoded.push_back(0);
+                const auto found = raw.find(member);
+                if (found != raw.end() && !found->second.empty())
+                {
+                    present = true;
+                    encoded.insert(encoded.end(), found->second.begin(), found->second.end());
+                }
+                encoded.push_back(0);
+            }
+            return present ? toLowerHex(sha256(encoded)) : std::string();
+        }
+
+        std::string currentMandatoryName(const std::string &name)
+        {
+            if (name == "product_uuid" || name == "board_serial" || name == "system_uuid" ||
+                name == "system_serial" || name == "chassis_serial")
+                return "platform_identity";
+            if (name == "gpu_id" || name == "monitor_edid")
+                return "display_group";
+            if (name == "computer_name" || name == "os_build")
+                return "software_environment";
+            if (name == "mac")
+                return "nic_identity";
+            return name;
+        }
+    }
+
+    // Factor-schema maintenance lives here. Collectors expose raw signals;
+    // this projection decides which signals consume threshold slots. Add a
+    // direct factor above or edit a group above. Never remove a v1 name: old
+    // helpers need the exact legacy projection. Semantic changes require a
+    // new norm version, a recovery projection, and migration tests.
+    std::map<std::string, std::string> projectFactors(const std::map<std::string, std::string> &raw,
+                                                      std::uint8_t normVersion)
+    {
+        std::map<std::string, std::string> out;
+        if (normVersion == kLegacyNormVersion)
+        {
+            for (const auto &name : legacyFactorNames())
+            {
+                const auto found = raw.find(name);
+                if (found != raw.end() && !found->second.empty())
+                    out[name] = found->second;
+            }
+            return out;
+        }
+        if (normVersion != kCurrentNormVersion)
+            throw std::runtime_error("slhwid: unsupported factor schema " + std::to_string(normVersion));
+        for (const auto &name : currentDirectFactorNames())
+        {
+            const auto found = raw.find(name);
+            if (found != raw.end() && !found->second.empty())
+                out[name] = found->second;
+        }
+        for (const auto &group : currentFactorGroups())
+        {
+            const auto value = groupValue(group, raw);
+            if (!value.empty())
+                out[group.name] = value;
+        }
+        return out;
+    }
+
+    std::set<std::string> mapMandatoryToCurrent(const std::set<std::string> &names)
+    {
+        std::set<std::string> out;
+        for (const auto &name : names)
+            out.insert(currentMandatoryName(name));
         return out;
     }
 
@@ -483,11 +601,12 @@ namespace slhwid::detail
     std::vector<unsigned char> serializeHelper(const std::map<std::string, Share> &shares,
                                                const std::set<std::string> &mandatory,
                                                int t, std::uint8_t salt,
-                                               const std::vector<unsigned char> &cw)
+                                               const std::vector<unsigned char> &cw,
+                                               std::uint8_t normVersion)
     {
         std::vector<unsigned char> payload;
         payload.push_back(1); // version
-        payload.push_back(1); // norm_version
+        payload.push_back(normVersion);
         payload.push_back(salt);
         payload.push_back(static_cast<unsigned char>(shares.size()));
         int m = 0;
@@ -547,20 +666,22 @@ namespace slhwid::detail
         const auto integrity = sha256(std::vector<unsigned char>(blob.begin(), blob.end() - 32));
         if (!ctEqual(integrity, std::vector<unsigned char>(blob.end() - 32, blob.end())))
             corrupt("integrity mismatch");
-        const std::uint32_t payloadLen = static_cast<std::uint32_t>(blob[8]) |
-                                         (static_cast<std::uint32_t>(blob[9]) << 8) |
-                                         (static_cast<std::uint32_t>(blob[10]) << 16) |
-                                         (static_cast<std::uint32_t>(blob[11]) << 24);
+        const std::uint32_t payloadLen =
+            static_cast<std::uint32_t>(blob[8]) | (static_cast<std::uint32_t>(blob[9]) << 8) |
+            (static_cast<std::uint32_t>(blob[10]) << 16) | (static_cast<std::uint32_t>(blob[11]) << 24);
         if (static_cast<std::size_t>(12) + payloadLen + 64 != blob.size())
             corrupt("length mismatch");
         const unsigned char *body = blob.data() + 12;
         const int n = body[3];
         Helper helper;
         helper.salt = body[2];
+        helper.normVersion = body[1];
         helper.threshold = body[5];
         helper.checkWord.assign(blob.data() + 12 + payloadLen, blob.data() + 12 + payloadLen + 32);
         if (body[0] != 1)
             corrupt("unsupported version");
+        if (body[1] != kLegacyNormVersion && body[1] != kCurrentNormVersion)
+            corrupt("unsupported factor schema");
         std::size_t offset = 8;
         std::set<std::string> seen;
         for (int i = 0; i < n; ++i)
@@ -880,7 +1001,7 @@ namespace slhwid::detail
                                 const Source &source,
                                 const std::shared_ptr<Store> &store)
     {
-        std::set<std::string> mandatory{"slstore"};
+        std::set<std::string> requestedMandatory{"slstore"};
         for (const auto &name : options.extraMandatory)
         {
             const bool valid = !name.empty() && name.size() <= 32 &&
@@ -890,13 +1011,13 @@ namespace slhwid::detail
             if (!valid)
                 return Result<Session>::fail(ErrorKind::Configuration,
                                               "slhwid: invalid extra mandatory slot name '" + name + "'");
-            mandatory.insert(name);
+            requestedMandatory.insert(name);
         }
 
-        std::map<std::string, std::string> factors;
+        std::map<std::string, std::string> rawFactors;
         try
         {
-            factors = normalizeFactors(collect());
+            rawFactors = normalizeFactors(collect());
         }
         catch (const std::exception &error)
         {
@@ -926,7 +1047,7 @@ namespace slhwid::detail
         // injects the persisted value (read-only). An absent value with an
         // existing helper is intentional tampering and recoverCore reports
         // it as a hard-locked mandatory failure below.
-        if (existing.data && !options.forceReenroll && factors.find("slstore") == factors.end())
+        if (existing.data && !options.forceReenroll && rawFactors.find("slstore") == rawFactors.end())
         {
             const auto stored = theStore->read("slstore");
             if (!stored.error.empty())
@@ -935,19 +1056,17 @@ namespace slhwid::detail
             if (stored.data)
             {
                 auto value = unwrapSlstore(*stored.data);
-                factors["slstore"] = toLowerHex(*value);
+                rawFactors["slstore"] = toLowerHex(*value);
             }
         }
 
         auto state = std::make_shared<SessionState>();
-        state->factors = factors;
-        state->mandatory = mandatory;
         state->store = theStore;
         state->source = source;
 
         if (!existing.data || options.forceReenroll)
         {
-            if (factors.find("slstore") == factors.end())
+            if (rawFactors.find("slstore") == rawFactors.end())
             {
                 const auto stored = theStore->read("slstore");
                 if (!stored.error.empty())
@@ -975,19 +1094,22 @@ namespace slhwid::detail
                                                      "slhwid: store secret write failed: " + writeError);
                     }
                 }
-                factors["slstore"] = toLowerHex(value);
-                state->factors = factors;
+                rawFactors["slstore"] = toLowerHex(value);
                 secureWipe(value.data(), value.size());
             }
+            const auto factors = projectFactors(rawFactors, kCurrentNormVersion);
+            const auto mandatory = mapMandatoryToCurrent(requestedMandatory);
+            state->factors = factors;
+            state->mandatory = mandatory;
             for (const auto &name : mandatory)
                 if (factors.find(name) == factors.end())
-                    return Result<Session>::fail(ErrorKind::LocalFailure,
-                                                 "slhwid: mandatory factor '" + name +
-                                                     "' is not available on this machine");
+                    return Result<Session>::fail(ErrorKind::LocalFailure, "slhwid: mandatory factor '" + name +
+                                                                              "' is not available on this machine");
             const int t = threshold(static_cast<int>(factors.size()), static_cast<int>(mandatory.size()));
             if (t == 0)
                 return Result<Session>::fail(ErrorKind::LocalFailure,
-                                             "slhwid: need at least 5 enrolled factors, have " +
+                                             "slhwid: need at least " + std::to_string(kMinimumFactors) +
+                                                 " enrolled factor slots, have " +
                                                  std::to_string(factors.size()));
             try
             {
@@ -1015,12 +1137,18 @@ namespace slhwid::detail
         }
 
         RecoverResult recovered;
+        Helper helper;
         try
         {
-            recovered = recoverCore(*existing.data, factors);
+            helper = parseHelper(*existing.data);
+            const auto recoveryFactors = projectFactors(rawFactors, helper.normVersion);
+            recovered = recoverCore(*existing.data, recoveryFactors);
         }
         catch (const std::exception &error)
         {
+            if (isCorruptError(error))
+                return Result<Session>::fail(ErrorKind::LocalFailure,
+                                             std::string(kCorruptPrefix) + "; re-enroll to recover");
             return Result<Session>::fail(ErrorKind::LocalFailure, error.what());
         }
         if (!recovered.ok)
@@ -1035,11 +1163,12 @@ namespace slhwid::detail
         state->expectedHelper = *existing.data;
         // A second application must not weaken a hard lock selected by the
         // application that enrolled the shared device helper.
-        const auto helper = parseHelper(*existing.data);
-        state->mandatory.clear();
+        std::set<std::string> storedMandatory;
         for (const auto &slot : helper.slots)
             if (slot.mandatory)
-                state->mandatory.insert(slot.name);
+                storedMandatory.insert(slot.name);
+        state->factors = projectFactors(rawFactors, kCurrentNormVersion);
+        state->mandatory = mapMandatoryToCurrent(storedMandatory);
         return Session(recovered.hwid, false, recovered.dead, recovered.pending, state);
     }
 }

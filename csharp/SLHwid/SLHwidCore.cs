@@ -130,17 +130,25 @@ internal static class SLHwidCore
 
     // ── threshold ──────────────────────────────────────────────────
 
+    // A conservative physical-machine floor is nine current-schema slots;
+    // requiring one fewer tolerates one additional unavailable collector.
+    // Re-evaluate this constant whenever factors or groups change.
+    public const int MinimumFactors = 8;
+
     public static int Threshold(int n, int m)
     {
-        if (n < 5)
+        if (n < MinimumFactors)
         {
-            throw new InvalidOperationException($"slhwid: need at least 5 enrolled factors, have {n}");
+            throw new InvalidOperationException(
+                $"slhwid: need at least {MinimumFactors} enrolled factor slots, have {n}");
         }
         if (m >= n)
         {
             throw new InvalidOperationException($"slhwid: mandatory slots ({m}) must be fewer than total ({n})");
         }
-        var (num, den) = n > 10 ? (4, 5) : (7, 10); // 80% above ten factors, else 70%
+        // Keep the full percentage policy explicit even though the current
+        // minimum means valid new/current helpers start on the 70% branch.
+        var (num, den) = n < 8 ? (4, 5) : (7, 10);
         var t = (num * n + den - 1) / den;
         return Math.Max(m + 1, Math.Min(t, n));
     }
@@ -155,7 +163,7 @@ internal static class SLHwidCore
     public static string Normalize(string name, string raw)
     {
         var value = raw.Replace("\0", "").Trim().ToLowerInvariant();
-        if (name == "mac")
+        if (name is "mac" or "nic_identity")
         {
             value = value.Replace(":", "").Replace("-", "");
         }
@@ -177,6 +185,104 @@ internal static class SLHwidCore
         }
         return output;
     }
+
+    public const byte LegacyNormVersion = 1;
+    public const byte CurrentNormVersion = 2;
+
+    private static readonly string[] LegacyFactorNames =
+    [
+        "slstore", "machine_guid", "product_uuid", "board_serial", "cpu_id", "disk_serial", "mac",
+        "ram_total", "volume_id", "computer_name", "firmware", "gpu_id", "monitor_edid", "os_build",
+    ];
+
+    private static readonly string[] CurrentDirectFactorNames =
+    [
+        "slstore", "machine_guid", "cpu_id", "disk_serial", "ram_total", "volume_id", "firmware",
+        "tpm_ek", "memory_modules", "nic_identity", "battery_serial",
+    ];
+
+    private static readonly (string Name, string[] Members)[] CurrentFactorGroups =
+    [
+        ("platform_identity", ["system_uuid", "board_serial", "system_serial", "chassis_serial"]),
+        ("display_group", ["gpu_id", "monitor_edid"]),
+        ("software_environment", ["computer_name", "os_build"]),
+    ];
+
+    // Factor-schema maintenance lives here. Collectors expose raw signals;
+    // this function decides which signals become threshold slots. Add a direct
+    // factor to CurrentDirectFactorNames, or edit CurrentFactorGroups for a
+    // capped failure domain. Never remove a legacy name: schema-v1 helpers
+    // need those exact inputs for recovery. Renames or semantic changes need a
+    // new norm version, a recovery projection, and migration tests.
+    public static Dictionary<string, string> ProjectFactors(Dictionary<string, string> raw, byte normVersion)
+    {
+        var output = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (normVersion == LegacyNormVersion)
+        {
+            foreach (var name in LegacyFactorNames)
+            {
+                if (raw.TryGetValue(name, out var value) && value.Length > 0)
+                {
+                    output[name] = value;
+                }
+            }
+            return output;
+        }
+        if (normVersion != CurrentNormVersion)
+        {
+            throw new InvalidOperationException($"slhwid: unsupported factor schema {normVersion}");
+        }
+        foreach (var name in CurrentDirectFactorNames)
+        {
+            if (raw.TryGetValue(name, out var value) && value.Length > 0)
+            {
+                output[name] = value;
+            }
+        }
+        foreach (var group in CurrentFactorGroups)
+        {
+            var value = GroupValue(group.Name, group.Members, raw);
+            if (value.Length > 0)
+            {
+                output[group.Name] = value;
+            }
+        }
+        return output;
+    }
+
+    private static string GroupValue(string name, string[] members, Dictionary<string, string> raw)
+    {
+        using var encoded = new MemoryStream();
+        encoded.Write(Encoding.ASCII.GetBytes("SL-HWID-GROUP2\0"));
+        encoded.Write(Encoding.ASCII.GetBytes(name));
+        encoded.WriteByte(0);
+        var present = false;
+        foreach (var member in members)
+        {
+            raw.TryGetValue(member, out var value);
+            present |= !string.IsNullOrEmpty(value);
+            encoded.Write(Encoding.ASCII.GetBytes(member));
+            encoded.WriteByte(0);
+            if (!string.IsNullOrEmpty(value))
+            {
+                encoded.Write(Encoding.UTF8.GetBytes(value));
+            }
+            encoded.WriteByte(0);
+        }
+        return present ? Convert.ToHexString(SHA256.HashData(encoded.ToArray())).ToLowerInvariant() : "";
+    }
+
+    public static string CurrentMandatoryName(string name) => name switch
+    {
+        "product_uuid" or "board_serial" or "system_uuid" or "system_serial" or "chassis_serial" => "platform_identity",
+        "gpu_id" or "monitor_edid" => "display_group",
+        "computer_name" or "os_build" => "software_environment",
+        "mac" => "nic_identity",
+        _ => name,
+    };
+
+    public static HashSet<string> MapMandatoryToCurrent(IEnumerable<string> names) =>
+        names.Select(CurrentMandatoryName).ToHashSet(StringComparer.Ordinal);
 
     // ── sharing ────────────────────────────────────────────────────
 
@@ -245,12 +351,12 @@ internal static class SLHwidCore
 
     // ── helper blob ────────────────────────────────────────────────
 
-    public static byte[] SerializeHelper(Dictionary<string, ulong[]> shares, HashSet<string> mandatory, int t, byte salt, byte[] cw)
+    public static byte[] SerializeHelper(Dictionary<string, ulong[]> shares, HashSet<string> mandatory, int t, byte salt, byte[] cw, byte normVersion = CurrentNormVersion)
     {
         var names = shares.Keys.Order().ToArray();
         using var payload = new MemoryStream();
         payload.WriteByte(1); // version
-        payload.WriteByte(1); // norm_version
+        payload.WriteByte(normVersion);
         payload.WriteByte(salt);
         payload.WriteByte((byte)names.Length);
         payload.WriteByte((byte)names.Count(n => mandatory.Contains(n)));
@@ -291,8 +397,9 @@ internal static class SLHwidCore
         public ulong[] Share { get; } = share;
     }
 
-    public sealed class Helper(byte salt, int threshold, List<HelperSlot> slots, byte[] checkWord)
+    public sealed class Helper(byte normVersion, byte salt, int threshold, List<HelperSlot> slots, byte[] checkWord)
     {
+        public byte NormVersion { get; } = normVersion;
         public byte Salt { get; } = salt;
         public int Threshold { get; } = threshold;
         public List<HelperSlot> Slots { get; } = slots;
@@ -326,8 +433,12 @@ internal static class SLHwidCore
         {
             throw Corrupt($"unsupported version {body[0]}");
         }
+        if (body[1] is not LegacyNormVersion and not CurrentNormVersion)
+        {
+            throw Corrupt($"unsupported factor schema {body[1]}");
+        }
         var n = body[3];
-        var helper = new Helper(body[2], body[5], new List<HelperSlot>(), cw);
+        var helper = new Helper(body[1], body[2], body[5], new List<HelperSlot>(), cw);
         var offset = 8;
         var seen = new HashSet<string>();
         for (var i = 0; i < n; i++)

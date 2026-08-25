@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -66,6 +67,13 @@ internal static class SLHwidCollectors
         Put(factors, "ram_total", RamTotal());
         Put(factors, "volume_id", VolumeSerial());
         Put(factors, "mac", MacAddress());
+
+        // Schema-v2 signals. The legacy signals above intentionally remain:
+        // existing schema-v1 helpers still need their original values to recover.
+        foreach (var (name, value) in WindowsSchemaV2Factors())
+        {
+            Put(factors, name, value);
+        }
         return factors;
     }
 
@@ -208,6 +216,35 @@ internal static class SLHwidCollectors
             .Where(line => line.Length > 0 && !string.Equals(line, column, StringComparison.OrdinalIgnoreCase));
     }
 
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static Dictionary<string, string> WindowsSchemaV2Factors()
+    {
+        // One PowerShell process obtains the CIM-backed SMBIOS/peripheral
+        // signals. WMIC is optional/deprecated on current Windows releases,
+        // so it must not be the only path for newly introduced factors.
+        const string script =
+            "$ErrorActionPreference='SilentlyContinue';" +
+            "function Emit($n,$v){$c=@($v|?{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|%{([string]$_).Trim()}|sort);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};" +
+            "$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;" +
+            "Emit 'chassis_serial' (Get-CimInstance Win32_SystemEnclosure).SerialNumber;" +
+            "Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;" +
+            "Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;" +
+            "Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress;" +
+            "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;" +
+            "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}";
+        var factors = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var line in Run("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 12)
+                     .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separator = line.IndexOf('=');
+            if (separator > 0 && separator + 1 < line.Length)
+            {
+                factors[line[..separator]] = line[(separator + 1)..];
+            }
+        }
+        return factors;
+    }
+
     private static string? MacAddress()
     {
         foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
@@ -239,6 +276,7 @@ internal static class SLHwidCollectors
         var expert = Run("ioreg", "-rd1 -c IOPlatformExpertDevice");
         Put(factors, "machine_guid", FirstMatch(expert, "\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\""));
         Put(factors, "board_serial", FirstMatch(expert, "\"IOPlatformSerialNumber\"\\s*=\\s*\"([^\"]+)\""));
+        Put(factors, "system_serial", FirstMatch(expert, "\"IOPlatformSerialNumber\"\\s*=\\s*\"([^\"]+)\""));
 
         var brand = Run("sysctl", "-n machdep.cpu.brand_string").Trim();
         if (brand.Length == 0)
@@ -252,10 +290,18 @@ internal static class SLHwidCollectors
         }
 
         Put(factors, "mac", FirstMatch(Run("ifconfig", "en0"), "ether\\s+([0-9a-fA-F:]{17})"));
+        Put(factors, "nic_identity", MultiInstance(AllMatches(
+            Run("networksetup", "-listallhardwareports"), "Ethernet Address:\\s*([0-9a-fA-F:]{17})")));
         Put(factors, "ram_total", Run("sysctl", "-n hw.memsize").Trim());
         Put(factors, "volume_id", FirstMatch(Run("diskutil", "info -plist /"), "<key>VolumeUUID</key>\\s*<string>([^<]+)</string>"));
         Put(factors, "computer_name", NullIfEmpty(Run("scutil", "--get ComputerName").Trim()) ?? NullIfEmpty(Run("scutil", "--get LocalHostName").Trim()));
         Put(factors, "firmware", FirstMatch(Run("system_profiler", "SPHardwareDataType -json", 5), "\"spmachine_bootrom_version\"\\s*:\\s*\"([^\"]+)\""));
+        Put(factors, "memory_modules", MultiInstance(AllMatches(
+            Run("system_profiler", "SPMemoryDataType -json", 5), "\"[^\"]*serial[^\"]*\"\\s*:\\s*\"([^\"]+)\"")));
+        var battery = Run("ioreg", "-r -c AppleSmartBattery");
+        Put(factors, "battery_serial",
+            NullIfEmpty(FirstMatch(battery, "\"BatterySerialNumber\"\\s*=\\s*\"([^\"]+)\""))
+            ?? NullIfEmpty(FirstMatch(battery, "\"Serial\"\\s*=\\s*\"?([^\"\\n]+)\"?")));
 
         var displays = Run("system_profiler", "SPDisplaysDataType -json", 5);
         var models = AllMatches(displays, "\"spdisplays_model\"\\s*:\\s*\"([^\"]+)\"");
@@ -306,6 +352,53 @@ internal static class SLHwidCollectors
         })
         {
             Put(factors, slot, ReadTextFile(path));
+        }
+        Put(factors, "system_uuid", ReadTextFile("/sys/class/dmi/id/product_uuid"));
+        Put(factors, "system_serial", ReadTextFile("/sys/class/dmi/id/product_serial"));
+        Put(factors, "chassis_serial", ReadTextFile("/sys/class/dmi/id/chassis_serial"));
+        Put(factors, "memory_modules", MultiInstance(AllMatches(
+            Run("dmidecode", "--type memory"), "(?m)^\\s*Serial Number:\\s*(\\S.*)$")));
+        var nicIds = new List<string>();
+        try
+        {
+            foreach (var iface in Directory.GetDirectories("/sys/class/net").Order())
+            {
+                if (!Directory.Exists(Path.Join(iface, "device")))
+                {
+                    continue;
+                }
+                var value = ReadTextFile(Path.Join(iface, "perm_address"));
+                if (!string.IsNullOrEmpty(value) && value != "00:00:00:00:00:00")
+                {
+                    nicIds.Add(value);
+                }
+            }
+        }
+        catch { }
+        Put(factors, "nic_identity", MultiInstance(nicIds));
+        var batteries = new List<string>();
+        try
+        {
+            foreach (var dir in Directory.GetDirectories("/sys/class/power_supply", "BAT*").Order())
+            {
+                var value = ReadTextFile(Path.Join(dir, "serial_number"));
+                if (!string.IsNullOrEmpty(value)) batteries.Add(value);
+            }
+        }
+        catch { }
+        Put(factors, "battery_serial", MultiInstance(batteries));
+        foreach (var path in new[] { "/sys/class/tpm/tpm0/device/ek_pub", "/sys/class/tpm/tpm0/ek_pub" })
+        {
+            try
+            {
+                var data = File.ReadAllBytes(path);
+                if (data.Length > 0)
+                {
+                    factors["tpm_ek"] = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
+                    break;
+                }
+            }
+            catch { }
         }
         {
             var cpuinfo = ReadTextFile("/proc/cpuinfo") ?? "";
@@ -440,6 +533,7 @@ internal static class SLHwidCollectors
                 FileName = fileName,
                 Arguments = arguments,
                 RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
@@ -448,6 +542,8 @@ internal static class SLHwidCollectors
             {
                 return "";
             }
+            var output = process.StandardOutput.ReadToEndAsync();
+            var errors = process.StandardError.ReadToEndAsync();
             using var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
             if (!process.WaitForExit(timeoutSeconds * 1000))
             {
@@ -461,7 +557,8 @@ internal static class SLHwidCollectors
                 }
                 return "";
             }
-            return process.StandardOutput.ReadToEnd();
+            errors.GetAwaiter().GetResult(); // drain diagnostics; collectors are deliberately best-effort
+            return output.GetAwaiter().GetResult();
         }
         catch
         {

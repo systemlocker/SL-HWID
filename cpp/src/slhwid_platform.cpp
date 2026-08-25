@@ -683,6 +683,35 @@ namespace slhwid::detail
             if (value && !value->empty())
                 factors[slot] = *value;
         }
+
+        std::map<std::string, std::string> windowsSchemaV2Factors()
+        {
+            // Use one CIM query process. WMIC is optional/deprecated on
+            // current Windows releases and cannot be the only collection path
+            // for newly introduced factors.
+            const std::string script =
+                "$ErrorActionPreference='SilentlyContinue';"
+                "function Emit($n,$v){$c=@($v|?{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|%{([string]$_).Trim()}|sort);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};"
+                "$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;"
+                "Emit 'chassis_serial' (Get-CimInstance Win32_SystemEnclosure).SerialNumber;"
+                "Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;"
+                "Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;"
+                "Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress;"
+                "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;"
+                "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}";
+            const auto output = popenCapture("powershell.exe -NoProfile -NonInteractive -Command \"" + script + "\" 2>nul");
+            std::map<std::string, std::string> factors;
+            std::istringstream lines(output);
+            std::string line;
+            while (std::getline(lines, line))
+            {
+                line = trim(line);
+                const auto separator = line.find('=');
+                if (separator != std::string::npos && separator > 0 && separator + 1 < line.size())
+                    factors[line.substr(0, separator)] = line.substr(separator + 1);
+            }
+            return factors;
+        }
     }
 
     std::map<std::string, std::string> collectFactors(std::string &error)
@@ -790,6 +819,11 @@ namespace slhwid::detail
             }
         }
 
+        // Schema-v2 signals. Legacy collection remains above because schema-v1
+        // helpers still need the original values during migration recovery.
+        for (const auto &[name, value] : windowsSchemaV2Factors())
+            put(factors, name, value);
+
         return factors;
     }
 
@@ -803,7 +837,10 @@ namespace slhwid::detail
         if (const auto uuid = firstMatch("\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\"", expert); !uuid.empty())
             factors["machine_guid"] = uuid;
         if (const auto serial = firstMatch("\"IOPlatformSerialNumber\"\\s*=\\s*\"([^\"]+)\"", expert); !serial.empty())
+        {
             factors["board_serial"] = serial;
+            factors["system_serial"] = serial;
+        }
 
         std::string brand = trim(popenCapture("sysctl -n machdep.cpu.brand_string"));
         if (brand.empty())
@@ -814,11 +851,17 @@ namespace slhwid::detail
 
         if (const auto mac = firstMatch("ether\\s+([0-9a-fA-F:]{17})", popenCapture("ifconfig en0")); !mac.empty())
             factors["mac"] = mac;
+        if (const auto addresses = allMatches("Ethernet Address:\\s*([0-9a-fA-F:]{17})",
+                                              popenCapture("networksetup -listallhardwareports"));
+            !addresses.empty())
+            factors["nic_identity"] = multiInstance(addresses);
 
         if (const auto total = trim(popenCapture("sysctl -n hw.memsize")); !total.empty())
             factors["ram_total"] = total;
 
-        if (const auto uuid = firstMatch("<key>VolumeUUID</key>\\s*<string>([^<]+)</string>", popenCapture("diskutil info -plist /")); !uuid.empty())
+        if (const auto uuid =
+                firstMatch("<key>VolumeUUID</key>\\s*<string>([^<]+)</string>", popenCapture("diskutil info -plist /"));
+            !uuid.empty())
             factors["volume_id"] = uuid;
 
         std::string computerName = trim(popenCapture("scutil --get ComputerName"));
@@ -827,16 +870,34 @@ namespace slhwid::detail
         if (!computerName.empty())
             factors["computer_name"] = computerName;
 
-        if (const auto bootrom = firstMatch("\"spmachine_bootrom_version\"\\s*:\\s*\"([^\"]+)\"", popenCapture("system_profiler SPHardwareDataType -json")); !bootrom.empty())
+        if (const auto bootrom = firstMatch("\"spmachine_bootrom_version\"\\s*:\\s*\"([^\"]+)\"",
+                                            popenCapture("system_profiler SPHardwareDataType -json"));
+            !bootrom.empty())
             factors["firmware"] = bootrom;
+        if (const auto serials = allMatches("\"[^\"]*serial[^\"]*\"\\s*:\\s*\"([^\"]+)\"",
+                                            popenCapture("system_profiler SPMemoryDataType -json"));
+            !serials.empty())
+            factors["memory_modules"] = multiInstance(serials);
+        const auto battery = popenCapture("ioreg -r -c AppleSmartBattery");
+        std::string batterySerial = firstMatch("\"BatterySerialNumber\"\\s*=\\s*\"([^\"]+)\"", battery);
+        if (batterySerial.empty())
+            batterySerial = firstMatch("\"Serial\"\\s*=\\s*\"?([^\"\\n]+)\"?", battery);
+        if (!batterySerial.empty())
+            factors["battery_serial"] = batterySerial;
 
-        if (const auto models = allMatches("\"spdisplays_model\"\\s*:\\s*\"([^\"]+)\"", popenCapture("system_profiler SPDisplaysDataType -json")); !models.empty())
+        if (const auto models = allMatches("\"spdisplays_model\"\\s*:\\s*\"([^\"]+)\"",
+                                           popenCapture("system_profiler SPDisplaysDataType -json"));
+            !models.empty())
             factors["gpu_id"] = multiInstance(models);
 
-        if (const auto serials = allMatches("\"[a-z_]*serial[a-z_]*\"\\s*:\\s*\"([^\"]+)\"", popenCapture("system_profiler SPStorageDataType -json")); !serials.empty())
+        if (const auto serials = allMatches("\"[a-z_]*serial[a-z_]*\"\\s*:\\s*\"([^\"]+)\"",
+                                            popenCapture("system_profiler SPStorageDataType -json"));
+            !serials.empty())
             factors["disk_serial"] = multiInstance(serials);
 
-        if (const auto blobs = allMatches("\"IODisplayEDID\"\\s*=\\s*<?([0-9a-fA-F]+)>?", popenCapture("ioreg -r -c IODisplayConnect")); !blobs.empty())
+        if (const auto blobs = allMatches("\"IODisplayEDID\"\\s*=\\s*<?([0-9a-fA-F]+)>?",
+                                          popenCapture("ioreg -r -c IODisplayConnect"));
+            !blobs.empty())
         {
             std::vector<std::string> lowered;
             for (const auto &blob : blobs)
@@ -858,23 +919,23 @@ namespace slhwid::detail
 
     namespace
     {
-        std::optional<std::string> firstPhysicalMac()
+    std::optional<std::string> firstPhysicalMac()
+    {
+        std::error_code ec;
+        for (const auto &entry : std::filesystem::directory_iterator("/sys/class/net", ec))
         {
-            std::error_code ec;
-            for (const auto &entry : std::filesystem::directory_iterator("/sys/class/net", ec))
-            {
-                const std::string name = entry.path().filename().string();
-                if (name == "lo" || name.rfind("veth", 0) == 0 || name.rfind("docker", 0) == 0 ||
-                    name.rfind("virbr", 0) == 0 || name.rfind("tun", 0) == 0 || name.rfind("tap", 0) == 0 ||
-                    name.rfind("zt", 0) == 0 || name.rfind("tailscale", 0) == 0)
-                    continue;
-                if (const auto address = readFileTrimmed("/sys/class/net/" + name + "/address");
-                    address && *address != "00:00:00:00:00:00")
-                    return *address;
-            }
-            return std::nullopt;
+            const std::string name = entry.path().filename().string();
+            if (name == "lo" || name.rfind("veth", 0) == 0 || name.rfind("docker", 0) == 0 ||
+                name.rfind("virbr", 0) == 0 || name.rfind("tun", 0) == 0 || name.rfind("tap", 0) == 0 ||
+                name.rfind("zt", 0) == 0 || name.rfind("tailscale", 0) == 0)
+                continue;
+            if (const auto address = readFileTrimmed("/sys/class/net/" + name + "/address");
+                address && *address != "00:00:00:00:00:00")
+                return *address;
         }
+        return std::nullopt;
     }
+    } // namespace
 
     std::map<std::string, std::string> collectFactors(std::string &error)
     {
@@ -889,6 +950,53 @@ namespace slhwid::detail
         {
             if (const auto value = readFileTrimmed(path))
                 factors[slot] = *value;
+        }
+        if (const auto value = readFileTrimmed("/sys/class/dmi/id/product_uuid"))
+            factors["system_uuid"] = *value;
+        if (const auto value = readFileTrimmed("/sys/class/dmi/id/product_serial"))
+            factors["system_serial"] = *value;
+        if (const auto value = readFileTrimmed("/sys/class/dmi/id/chassis_serial"))
+            factors["chassis_serial"] = *value;
+        if (const auto serials =
+                allMatches("Serial Number:\\s*([^\\r\\n]+)", popenCapture("dmidecode --type memory 2>/dev/null"));
+            !serials.empty())
+            factors["memory_modules"] = multiInstance(serials);
+
+        std::vector<std::string> nicIdentities;
+        std::error_code factorEc;
+        for (const auto &entry : std::filesystem::directory_iterator("/sys/class/net", factorEc))
+        {
+            if (!std::filesystem::exists(entry.path() / "device", factorEc))
+                continue;
+            if (const auto address = readFileTrimmed((entry.path() / "perm_address").string());
+                address && *address != "00:00:00:00:00:00")
+                nicIdentities.push_back(*address);
+        }
+        if (!nicIdentities.empty())
+            factors["nic_identity"] = multiInstance(nicIdentities);
+
+        std::vector<std::string> batterySerials;
+        for (const auto &entry : std::filesystem::directory_iterator("/sys/class/power_supply", factorEc))
+        {
+            if (entry.path().filename().string().rfind("BAT", 0) != 0)
+                continue;
+            if (const auto serial = readFileTrimmed((entry.path() / "serial_number").string()))
+                batterySerials.push_back(*serial);
+        }
+        if (!batterySerials.empty())
+            factors["battery_serial"] = multiInstance(batterySerials);
+
+        for (const auto &path : {"/sys/class/tpm/tpm0/device/ek_pub", "/sys/class/tpm/tpm0/ek_pub"})
+        {
+            std::ifstream ek(path, std::ios::binary);
+            if (!ek)
+                continue;
+            std::vector<unsigned char> data((std::istreambuf_iterator<char>(ek)), std::istreambuf_iterator<char>());
+            if (!data.empty())
+            {
+                factors["tpm_ek"] = toLowerHex(sha256(data));
+                break;
+            }
         }
         {
             std::ifstream cpuinfo("/proc/cpuinfo");

@@ -1,12 +1,11 @@
 # SL-HWID
 
 A fault-tolerant, cross-platform hardware fingerprint. SL-HWID combines
-**14 hardware factors** by default — any two can fail or change without
-changing the identifier, and drifted factors are quietly re-absorbed after
-each successful use. The point is to prevent over-fitting to any single
-machine detail while avoiding over-dependence on the exact hardware
-configuration: no more support tickets because a user swapped a monitor,
-no more free re-activations because a pirate spoofed one value.
+independent over 14 signals, applying weighted shares to less stable values.
+Drifted slots are quietly re-absorbed after each successful use. The point
+is to prevent over-fitting to any single machine detail while avoiding
+over-dependence on the exact hardware configuration: routine changes such as
+swapping a monitor should not require a HWID reset.
 
 Under the hood, a random high-entropy key is shared across the factors with
 a threshold scheme; the identifier is a domain-separated hash of that key.
@@ -90,9 +89,18 @@ changing mandatory slots affects every application that shares the store.
 - The first `Prepare` on a machine enrolls it (a new random key); later
   calls recover the same key as long as the threshold holds. Commit after
   each successful authorization to absorb drifted factors.
-- Fewer factors than 14 may be available on a given machine; the threshold
-  adapts (80% agreement above ten factors, 70% for five to ten). Fewer
-  than five available factors throws an error, instead of accepting a
-  weaker latch.
+- The percentage policy is 80% below eight enrolled slots and 70% from eight
+  upward. New enrollment and re-centering require at least eight available
+  slots, so current helpers begin on the 70% branch instead of accepting a
+  weaker latch. Existing helpers can still recover below that floor; their
+  migration waits until enough current slots exist.
+- Platform identifiers, display identifiers, and software-environment signals
+  are grouped so each correlated set consumes only one recovery slot.
+- Existing schema-v1 helpers remain recoverable. After successful
+  authorization, `Commit` rewrites the helper with the current schema while
+  preserving the HWID.
 - The persisted formats, helper name, and lock marker are identical across
   the C++ and C# implementations and across platforms.
+
+Maintainers: see [Factor schema and migrations](FACTOR-SCHEMA.md) before
+adding, removing, renaming, regrouping, or changing a collected signal.
