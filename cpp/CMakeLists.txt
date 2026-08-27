@@ -37,7 +37,7 @@ if(NOT SLHWID_STATIC)
 endif()
 
 if(WIN32)
-    target_link_libraries(slhwid PRIVATE bcrypt)
+    target_link_libraries(slhwid PRIVATE bcrypt iphlpapi)
 endif()
 
 if(MSVC)

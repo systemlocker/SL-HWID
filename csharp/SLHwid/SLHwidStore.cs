@@ -4,9 +4,9 @@ using System.Security.Cryptography;
 namespace SLHwid;
 
 // Persists the module's own random value and the shared device helper blob.
-// Windows uses the registry (HKLM with an HKCU fallback); other
-// platforms use files in the platform's data directory. All formats are the
-// normative cross-language ones.
+// Windows pins both values to one registry hive (HKLM with an HKCU fallback);
+// other platforms use files in the platform's data directory. All formats
+// are the normative cross-language ones.
 internal interface ISSStore
 {
     /// <summary>Returns the 32-byte store secret, or null when absent.</summary>
@@ -23,6 +23,28 @@ internal interface ISSStore
 internal interface ISSStoreLockable
 {
     IDisposable AcquireLock();
+}
+
+internal enum RegistryRootSelection
+{
+    None,
+    Machine,
+    User,
+}
+
+internal static class RegistryRootPolicy
+{
+    internal static RegistryRootSelection Select(
+        bool machineHelper, bool machineSlstore, bool userHelper, bool userSlstore)
+    {
+        if (machineHelper && machineSlstore) return RegistryRootSelection.Machine;
+        if (userHelper && userSlstore) return RegistryRootSelection.User;
+        if (machineHelper) return RegistryRootSelection.Machine;
+        if (userHelper) return RegistryRootSelection.User;
+        if (machineSlstore) return RegistryRootSelection.Machine;
+        if (userSlstore) return RegistryRootSelection.User;
+        return RegistryRootSelection.None;
+    }
 }
 
 internal static class SLHwidStore
@@ -277,6 +299,7 @@ internal sealed class DirStore(string directory) : ISSStore, ISSStoreLockable
 internal sealed class RegistryStore : ISSStore, ISSStoreLockable
 {
     private const string SubKey = @"SOFTWARE\SystemLocker";
+    private Microsoft.Win32.RegistryHive? _selectedHive;
 
     private static byte[]? Read(Microsoft.Win32.RegistryHive hive, string name)
     {
@@ -311,46 +334,66 @@ internal sealed class RegistryStore : ISSStore, ISSStoreLockable
 
     public byte[]? ReadSlstore()
     {
-        foreach (var root in Roots())
-        {
-            var data = Read(root, "SLStore");
-            if (data is not null)
-            {
-                return SLHwidStore.UnwrapSlstore(data);
-            }
-        }
-        return null;
+        var root = _selectedHive ?? SelectHive();
+        var data = root is null ? null : Read(root.Value, "SLStore");
+        return data is null ? null : SLHwidStore.UnwrapSlstore(data);
     }
 
     public void WriteSlstore(byte[] value)
     {
         var blob = SLHwidCore.SlstorePrefix.Concat(value).ToArray();
-        if (!Write(Microsoft.Win32.RegistryHive.LocalMachine, "SLStore", blob) &&
-            !Write(Microsoft.Win32.RegistryHive.CurrentUser, "SLStore", blob))
-        {
-            throw new IOException("slhwid: registry write failed");
-        }
+        WriteSelected("SLStore", blob);
     }
 
     public byte[]? ReadHelper()
     {
-        foreach (var root in Roots())
-        {
-            if (Read(root, "HWID-device") is { } blob)
-            {
-                return blob;
-            }
-        }
-        return null;
+        var root = _selectedHive ?? SelectHive();
+        return root is null ? null : Read(root.Value, "HWID-device");
     }
 
     public void WriteHelper(byte[] blob)
     {
-        if (!Write(Microsoft.Win32.RegistryHive.LocalMachine, "HWID-device", blob) &&
-            !Write(Microsoft.Win32.RegistryHive.CurrentUser, "HWID-device", blob))
+        WriteSelected("HWID-device", blob);
+    }
+
+    private Microsoft.Win32.RegistryHive? SelectHive()
+    {
+        // A helper and its mandatory store secret form one generation. Never
+        // choose the two values independently across HKLM/HKCU: that can make
+        // valid data look corrupt after an elevation or reinstall change.
+        var selected = RegistryRootPolicy.Select(
+            Read(Microsoft.Win32.RegistryHive.LocalMachine, "HWID-device") is not null,
+            Read(Microsoft.Win32.RegistryHive.LocalMachine, "SLStore") is not null,
+            Read(Microsoft.Win32.RegistryHive.CurrentUser, "HWID-device") is not null,
+            Read(Microsoft.Win32.RegistryHive.CurrentUser, "SLStore") is not null);
+        _selectedHive = selected switch
         {
-            throw new IOException("slhwid: registry write failed");
+            RegistryRootSelection.Machine => Microsoft.Win32.RegistryHive.LocalMachine,
+            RegistryRootSelection.User => Microsoft.Win32.RegistryHive.CurrentUser,
+            _ => null,
+        };
+        return _selectedHive;
+    }
+
+    private void WriteSelected(string name, byte[] data)
+    {
+        if (_selectedHive is { } selected)
+        {
+            if (!Write(selected, name, data))
+            {
+                throw new IOException("slhwid: registry write failed");
+            }
+            return;
         }
+        foreach (var root in Roots())
+        {
+            if (Write(root, name, data))
+            {
+                _selectedHive = root;
+                return;
+            }
+        }
+        throw new IOException("slhwid: registry write failed");
     }
 
     public IDisposable AcquireLock() => SLHwidStore.AcquireFileLock(SLHwidStore.LocalLockDirectory());

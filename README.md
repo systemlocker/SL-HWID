@@ -104,3 +104,13 @@ changing mandatory slots affects every application that shares the store.
 
 Maintainers: see [Factor schema and migrations](FACTOR-SCHEMA.md) before
 adding, removing, renaming, regrouping, or changing a collected signal.
+
+## HOTFIX 2.0.1
+
+Here's what we changed:
+
+- The helper and its `SLStore` secret are always selected and written in the same hive, so an elevation change cannot pair values from different enrollments. If both hives contain complete enrollments, HKLM wins; use `ForceReenroll` to replace an intentionally abandoned generation.
+
+- Windows collection does not require WMIC. The SMBIOS UUID, stable disk and volume properties, and NIC identity come from native Windows APIs; PowerShell/CIM contributes optional signals under a bounded deadline and never replaces a native value.
+
+- Factor normalization drops implausible values before enrollment, including byte-count mistakes for RAM, nil/example UUIDs, all-zero/all-`f` identifiers, malformed MACs, oversized values, and common firmware placeholders.

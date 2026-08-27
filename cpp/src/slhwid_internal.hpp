@@ -152,6 +152,17 @@ namespace slhwid::detail
     };
 
     std::shared_ptr<Store> defaultStore(const std::string &overridePath, std::string &error);
+    enum class RegistryRootSelection
+    {
+        none,
+        machine,
+        user,
+    };
+    RegistryRootSelection selectRegistryRoot(bool machineHelper, bool machineSlstore,
+                                             bool userHelper, bool userSlstore);
+    std::optional<std::string> parseRawSmbiosUuid(const std::vector<unsigned char> &raw);
+    std::optional<std::string> parseStorageDescriptorSerial(
+        const std::vector<unsigned char> &descriptor, std::size_t returned);
     bool acquireStorageLock(const std::string &directory, std::function<void()> &release, std::string &error);
     std::map<std::string, std::string> collectFactors(std::string &error);
 

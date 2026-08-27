@@ -24,6 +24,21 @@ domain-separated SHA-256 digest over the group name and the complete,
 fixed-order member list, including empty members. Any member change changes
 the group, but the entire group can lose only one threshold vote.
 
+## Sanity filtering
+
+Normalization rejects a raw value before projection when its UTF-8 encoding
+exceeds 4096 bytes, it is a known firmware placeholder, or its slot-specific
+shape is implausible. `ram_total` is decimal bytes and must be at least
+134217728 (128 MiB - change if your application could live on older Linux
+machines). UUID inputs accept 32 hexadecimal digits or the canonical
+hyphenated form, excluding nil, all-`f`, and the common
+`12345678-1234-1234-1234-123456789abc` example. `slstore` and `tpm_ek` are
+64 hexadecimal digits; MAC/NIC instances are 12 hexadecimal digits.
+Identifier and serial slots reject empty multi-instance members, known
+placeholder components, and values made entirely of zeroes or `f`s. These
+checks are deliberately conservative: they catch unit mistakes and sentinel
+data without trying to guess vendor-specific serial-number formats.
+
 The percentage policy is `ceil(80% × slots)` below eight slots and
 `ceil(70% × slots)` from eight upward. New enrollment and re-centering require
 at least eight slots, so current helpers begin on the 70% branch. The threshold
@@ -86,6 +101,12 @@ system/chassis serials, and battery serial are optional. Firmware permissions,
 virtual machines, older hardware, and operating-system tools can make any of
 them unavailable. Collector failures should produce an absent signal, never a
 synthetic placeholder or an application failure.
+
+Windows essentials use native operating-system APIs. `system_uuid` is the
+SMBIOS Type-1 UUID read through `GetSystemFirmwareTable`; it is not Windows'
+derived `ComputerHardwareId`. Do not introduce a WMIC dependency: the utility
+is absent on current Windows installations. CIM-based signals are optional,
+bounded enrichment and never overwrite a value obtained natively.
 
 Treat collected values as device identifiers: do not log them, send them to a
 server, or expose them in error messages. The helper stores threshold shares,

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 
 namespace slhwid::detail
@@ -378,9 +379,99 @@ namespace slhwid::detail
         const std::set<std::string> &placeholders()
         {
             static const std::set<std::string> values = {
-                "", "none", "unknown", "default string",
-                "to be filled by o.e.m.", "not specified", "system serial number"};
+                "", "0", "none", "unknown", "default", "default string", "to be filled by o.e.m.",
+                "not specified", "not available", "not applicable", "not present", "n/a", "na", "null",
+                "system serial number", "asset tag", "no asset tag", "123456789", "0123456789", "example"};
             return values;
+        }
+
+        const std::set<std::string> &identifierFactors()
+        {
+            static const std::set<std::string> names = {
+                "machine_guid", "product_uuid", "system_uuid", "board_serial", "system_serial", "chassis_serial",
+                "disk_serial", "volume_id", "tpm_ek", "memory_modules", "nic_identity", "battery_serial", "monitor_edid"};
+            return names;
+        }
+
+        bool asciiHex(unsigned char c)
+        {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        }
+
+        bool degenerateIdentifier(const std::string &value)
+        {
+            std::string compact;
+            for (const unsigned char c : value)
+                if (std::isalnum(c) != 0)
+                    compact.push_back(static_cast<char>(c));
+            return compact.size() >= 4 &&
+                   (std::all_of(compact.begin(), compact.end(), [](char c) { return c == '0'; }) ||
+                    std::all_of(compact.begin(), compact.end(), [](char c) { return c == 'f'; }));
+        }
+
+        bool uuidLike(const std::string &value)
+        {
+            const bool hyphensValid = value.size() == 32 ||
+                                       (value.size() == 36 && value[8] == '-' && value[13] == '-' &&
+                                        value[18] == '-' && value[23] == '-');
+            std::string compact;
+            for (const char c : value)
+                if (c != '-')
+                    compact.push_back(c);
+            return hyphensValid && compact.size() == 32 &&
+                   std::all_of(compact.begin(), compact.end(), [](unsigned char c) { return asciiHex(c); }) &&
+                   !degenerateIdentifier(compact) && compact != "12345678123412341234123456789abc";
+        }
+
+        bool saneFactor(const std::string &name, const std::string &value)
+        {
+            if (value.empty() || value.size() > 4096 || placeholders().count(value) > 0)
+                return false;
+            if (name == "ram_total")
+            {
+                if (!std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
+                    return false;
+                try
+                {
+                    return std::stoull(value) >= 128ULL * 1024 * 1024;
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            }
+            if (name == "machine_guid" || name == "product_uuid" || name == "system_uuid")
+                return uuidLike(value);
+            if (name == "slstore")
+                return value.size() == 64 &&
+                       std::all_of(value.begin(), value.end(), [](unsigned char c) { return asciiHex(c); }) &&
+                       !degenerateIdentifier(value);
+            if (name == "tpm_ek" &&
+                (value.size() != 64 || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return asciiHex(c); })))
+                return false;
+
+            const bool multiIdentifier = name == "mac" || name == "nic_identity" || identifierFactors().count(name) > 0;
+            if (multiIdentifier && (value.front() == '|' || value.back() == '|' || value.find("||") != std::string::npos))
+                return false;
+
+            std::istringstream parts(value);
+            std::string part;
+            if (name == "mac" || name == "nic_identity")
+            {
+                while (std::getline(parts, part, '|'))
+                    if (part.size() != 12 ||
+                        !std::all_of(part.begin(), part.end(), [](unsigned char c) { return asciiHex(c); }) ||
+                        degenerateIdentifier(part))
+                        return false;
+                return true;
+            }
+            if (identifierFactors().count(name) > 0)
+            {
+                while (std::getline(parts, part, '|'))
+                    if (placeholders().count(part) > 0 || degenerateIdentifier(part))
+                        return false;
+            }
+            return true;
         }
     }
 
@@ -389,7 +480,7 @@ namespace slhwid::detail
         std::string value = trimNulAndSpace(raw);
         std::transform(value.begin(), value.end(), value.begin(),
                        [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
+                       { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c); });
         if (name == "mac" || name == "nic_identity")
             value.erase(std::remove_if(value.begin(), value.end(),
                                        [](char c)
@@ -409,7 +500,7 @@ namespace slhwid::detail
         for (const auto &[name, value] : raw)
         {
             const std::string normalized = normalize(name, value);
-            if (!normalized.empty() && !isMissing(normalized))
+            if (saneFactor(name, normalized))
                 out[name] = normalized;
         }
         return out;
@@ -659,6 +750,11 @@ namespace slhwid::detail
 
     Helper parseHelper(const std::vector<unsigned char> &blob)
     {
+        // Valid helpers are currently below 1 KiB. Bound the untrusted local
+        // blob before parsing so it cannot drive large allocations or a
+        // combinatorial recovery search.
+        if (blob.size() > 4096)
+            corrupt("oversized");
         if (blob.size() < 8 + 4 + 8 + 32 + 32)
             corrupt("truncated");
         if (std::memcmp(blob.data(), "SLSSHWID", 8) != 0)
@@ -669,10 +765,10 @@ namespace slhwid::detail
         const std::uint32_t payloadLen =
             static_cast<std::uint32_t>(blob[8]) | (static_cast<std::uint32_t>(blob[9]) << 8) |
             (static_cast<std::uint32_t>(blob[10]) << 16) | (static_cast<std::uint32_t>(blob[11]) << 24);
-        if (static_cast<std::size_t>(12) + payloadLen + 64 != blob.size())
+        if (payloadLen < 8 || payloadLen > 4096 ||
+            static_cast<std::uint64_t>(12) + payloadLen + 64 != blob.size())
             corrupt("length mismatch");
         const unsigned char *body = blob.data() + 12;
-        const int n = body[3];
         Helper helper;
         helper.salt = body[2];
         helper.normVersion = body[1];
@@ -682,8 +778,29 @@ namespace slhwid::detail
             corrupt("unsupported version");
         if (body[1] != kLegacyNormVersion && body[1] != kCurrentNormVersion)
             corrupt("unsupported factor schema");
+        if (body[6] != 0 || body[7] != 0)
+            corrupt("reserved header bits set");
+
+        std::set<std::string> allowedNames;
+        if (body[1] == kLegacyNormVersion)
+            allowedNames.insert(legacyFactorNames().begin(), legacyFactorNames().end());
+        else
+        {
+            allowedNames.insert(currentDirectFactorNames().begin(), currentDirectFactorNames().end());
+            for (const auto &group : currentFactorGroups())
+                allowedNames.insert(group.name);
+        }
+        const int n = body[3];
+        const int mandatoryHeader = body[4];
+        if (n == 0 || n > static_cast<int>(allowedNames.size()))
+            corrupt("invalid slot count");
+        if (helper.threshold == 0 || helper.threshold > n || mandatoryHeader == 0 || mandatoryHeader >= helper.threshold)
+            corrupt("invalid threshold");
+
         std::size_t offset = 8;
         std::set<std::string> seen;
+        std::string previousName;
+        int actualMandatory = 0;
         for (int i = 0; i < n; ++i)
         {
             if (offset + 1 > payloadLen)
@@ -693,9 +810,17 @@ namespace slhwid::detail
                 corrupt("slot truncated");
             HelperSlot slot;
             slot.name.assign(reinterpret_cast<const char *>(body + offset + 1), nameLen);
-            if (!seen.insert(slot.name).second)
-                corrupt("duplicate slot");
-            slot.mandatory = (body[offset + 1 + nameLen] & 1) == 1;
+            if (allowedNames.count(slot.name) == 0)
+                corrupt("invalid slot");
+            if (!seen.insert(slot.name).second || (!previousName.empty() && previousName >= slot.name))
+                corrupt("duplicate or unsorted slot");
+            previousName = slot.name;
+            const unsigned char flags = body[offset + 1 + nameLen];
+            if (flags != 0 && flags != 1)
+                corrupt("invalid slot flags");
+            slot.mandatory = flags == 1;
+            if (slot.mandatory)
+                ++actualMandatory;
             for (int limb = 0; limb < 4; ++limb)
             {
                 slot.share[limb] = readLE64(body + offset + 2 + nameLen + limb * 8);
@@ -707,6 +832,12 @@ namespace slhwid::detail
         }
         if (offset != payloadLen)
             corrupt("trailing bytes");
+        if (actualMandatory != mandatoryHeader)
+            corrupt("mandatory count mismatch");
+        const auto slstore = std::find_if(helper.slots.begin(), helper.slots.end(), [](const HelperSlot &slot)
+                                          { return slot.name == "slstore" && slot.mandatory; });
+        if (slstore == helper.slots.end())
+            corrupt("mandatory slstore missing");
         return helper;
     }
 

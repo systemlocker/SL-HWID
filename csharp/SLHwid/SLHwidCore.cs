@@ -75,7 +75,11 @@ internal static class SLHwidCore
 
     public static ulong DeriveX(string slot, string value, byte salt)
     {
-        var input = new byte[12 + slot.Length + value.Length]; // label + \0 + salt + \0 + slot + \0 + value
+        var slotBytes = Encoding.ASCII.GetBytes(slot);
+        var valueBytes = Encoding.UTF8.GetBytes(value);
+        // Length counts encoded bytes, not UTF-16 code units. Hardware strings
+        // can legitimately contain non-ASCII characters.
+        var input = new byte[12 + slotBytes.Length + valueBytes.Length]; // label + \0 + salt + \0 + slot + \0 + value
         var offset = 0;
         void Put(byte[] bytes)
         {
@@ -86,9 +90,9 @@ internal static class SLHwidCore
         input[offset++] = 0;
         input[offset++] = salt;
         input[offset++] = 0;
-        Put(Encoding.ASCII.GetBytes(slot));
+        Put(slotBytes);
         input[offset++] = 0;
-        Put(Encoding.UTF8.GetBytes(value));
+        Put(valueBytes);
         var h = SHA256.HashData(input);
         var v = BitConverter.ToUInt64(h, 0) & Prime;
         return 1 + v % (Prime - 1);
@@ -157,12 +161,30 @@ internal static class SLHwidCore
 
     private static readonly HashSet<string> Placeholders = new(StringComparer.Ordinal)
     {
-        "", "none", "unknown", "default string", "to be filled by o.e.m.", "not specified", "system serial number",
+        "", "0", "none", "unknown", "default", "default string", "to be filled by o.e.m.",
+        "not specified", "not available", "not applicable", "not present", "n/a", "na", "null",
+        "system serial number", "asset tag", "no asset tag", "123456789", "0123456789", "example",
+    };
+
+    private static readonly HashSet<string> IdentifierFactors = new(StringComparer.Ordinal)
+    {
+        "machine_guid", "product_uuid", "system_uuid", "board_serial", "system_serial", "chassis_serial",
+        "disk_serial", "volume_id", "tpm_ek", "memory_modules", "nic_identity", "battery_serial", "monitor_edid",
     };
 
     public static string Normalize(string name, string raw)
     {
-        var value = raw.Replace("\0", "").Trim().ToLowerInvariant();
+        var chars = raw.Replace("\0", "").Trim().ToCharArray();
+        // The wire contract specifies ASCII lowercase. Unicode hardware text
+        // must otherwise remain byte-stable across native and managed clients.
+        for (var i = 0; i < chars.Length; i++)
+        {
+            if (chars[i] is >= 'A' and <= 'Z')
+            {
+                chars[i] = (char)(chars[i] + ('a' - 'A'));
+            }
+        }
+        var value = new string(chars);
         if (name is "mac" or "nic_identity")
         {
             value = value.Replace(":", "").Replace("-", "");
@@ -172,13 +194,69 @@ internal static class SLHwidCore
 
     public static bool IsMissing(string value) => Placeholders.Contains(value.Trim());
 
+    public static bool IsSaneFactor(string name, string value)
+    {
+        if (value.Length == 0 || Encoding.UTF8.GetByteCount(value) > 4096 || IsMissing(value))
+        {
+            return false;
+        }
+        if (name == "ram_total")
+        {
+            // All collectors report bytes. 128 MiB is deliberately far below
+            // supported desktop/server hardware while rejecting unit mistakes
+            // such as a KiB value being labeled as bytes.
+            return value.All(char.IsAsciiDigit)
+                && ulong.TryParse(value, out var bytes)
+                && bytes >= 128UL * 1024 * 1024;
+        }
+        if (name is "machine_guid" or "product_uuid" or "system_uuid")
+        {
+            return IsUuidLike(value);
+        }
+        if (name == "slstore")
+        {
+            return value.Length == 64 && value.All(Uri.IsHexDigit) && !IsDegenerateIdentifier(value);
+        }
+        if (name == "tpm_ek" && (value.Length != 64 || !value.All(Uri.IsHexDigit)))
+        {
+            return false;
+        }
+        if (name is "mac" or "nic_identity")
+        {
+            return value.Split('|').All(part => part.Length == 12 && part.All(Uri.IsHexDigit)
+                && !IsDegenerateIdentifier(part));
+        }
+        if (IdentifierFactors.Contains(name))
+        {
+            return value.Split('|').All(part => !IsMissing(part) && !IsDegenerateIdentifier(part));
+        }
+        return true;
+    }
+
+    private static bool IsUuidLike(string value)
+    {
+        var hyphensValid = value.Length == 32 || value.Length == 36
+            && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-';
+        var compact = value.Replace("-", "");
+        return hyphensValid && compact.Length == 32 && compact.All(Uri.IsHexDigit)
+            && !IsDegenerateIdentifier(compact)
+            && compact != "12345678123412341234123456789abc";
+    }
+
+    private static bool IsDegenerateIdentifier(string value)
+    {
+        var compact = new string(value.Where(char.IsLetterOrDigit).ToArray());
+        return compact.Length >= 4
+            && (compact.All(c => c == '0') || compact.All(c => c == 'f'));
+    }
+
     public static Dictionary<string, string> NormalizeFactors(Dictionary<string, string> raw)
     {
         var output = new Dictionary<string, string>();
         foreach (var (name, value) in raw)
         {
             var nv = Normalize(name, value);
-            if (nv.Length > 0 && !IsMissing(nv))
+            if (IsSaneFactor(name, nv))
             {
                 output[name] = nv;
             }
@@ -409,6 +487,13 @@ internal static class SLHwidCore
     public static Helper ParseHelper(byte[] blob)
     {
         Exception Corrupt(string why) => new SecretSharingCorruptException($"slhwid: stored helper data is corrupt: {why}");
+        // A valid helper is currently under 1 KiB. Bound the untrusted local
+        // blob before hashing/parsing so a writable store cannot force large
+        // allocations or an unbounded recovery search.
+        if (blob.Length > 4096)
+        {
+            throw Corrupt("oversized");
+        }
         if (blob.Length < 8 + 4 + 8 + 32 + 32)
         {
             throw Corrupt("truncated");
@@ -422,13 +507,13 @@ internal static class SLHwidCore
         {
             throw Corrupt("integrity mismatch");
         }
-        var payloadLen = BitConverter.ToInt32(blob, 8);
-        if (12 + payloadLen + 64 != blob.Length)
+        var payloadLen = BitConverter.ToUInt32(blob, 8);
+        if (payloadLen < 8 || payloadLen > 4096 || 12UL + payloadLen + 64UL != (ulong)blob.Length)
         {
             throw Corrupt("length mismatch");
         }
-        var body = blob.AsSpan(12, payloadLen).ToArray();
-        var cw = blob.AsSpan(12 + payloadLen, 32).ToArray();
+        var body = blob.AsSpan(12, checked((int)payloadLen)).ToArray();
+        var cw = blob.AsSpan(12 + checked((int)payloadLen), 32).ToArray();
         if (body[0] != 1)
         {
             throw Corrupt($"unsupported version {body[0]}");
@@ -437,10 +522,29 @@ internal static class SLHwidCore
         {
             throw Corrupt($"unsupported factor schema {body[1]}");
         }
+        if (body[6] != 0 || body[7] != 0)
+        {
+            throw Corrupt("reserved header bits set");
+        }
+        var allowedNames = body[1] == LegacyNormVersion
+            ? LegacyFactorNames.ToHashSet(StringComparer.Ordinal)
+            : CurrentDirectFactorNames.Concat(CurrentFactorGroups.Select(g => g.Name)).ToHashSet(StringComparer.Ordinal);
         var n = body[3];
-        var helper = new Helper(body[1], body[2], body[5], new List<HelperSlot>(), cw);
+        var mandatoryHeader = body[4];
+        var threshold = body[5];
+        if (n == 0 || n > allowedNames.Count)
+        {
+            throw Corrupt("invalid slot count");
+        }
+        if (threshold == 0 || threshold > n || mandatoryHeader == 0 || mandatoryHeader >= threshold)
+        {
+            throw Corrupt("invalid threshold");
+        }
+        var helper = new Helper(body[1], body[2], threshold, new List<HelperSlot>(), cw);
         var offset = 8;
         var seen = new HashSet<string>();
+        string? previousName = null;
+        var actualMandatory = 0;
         for (var i = 0; i < n; i++)
         {
             if (offset + 1 > body.Length)
@@ -453,11 +557,25 @@ internal static class SLHwidCore
                 throw Corrupt("slot truncated");
             }
             var name = Encoding.ASCII.GetString(body, offset + 1, nameLen);
-            if (!seen.Add(name))
+            if (!allowedNames.Contains(name))
             {
-                throw Corrupt($"duplicate slot {name}");
+                throw Corrupt($"invalid slot {name}");
             }
-            var mandatory = (body[offset + 1 + nameLen] & 1) == 1;
+            if (!seen.Add(name) || previousName is not null && string.CompareOrdinal(previousName, name) >= 0)
+            {
+                throw Corrupt($"duplicate or unsorted slot {name}");
+            }
+            previousName = name;
+            var flags = body[offset + 1 + nameLen];
+            if (flags is not 0 and not 1)
+            {
+                throw Corrupt("invalid slot flags");
+            }
+            var mandatory = flags == 1;
+            if (mandatory)
+            {
+                actualMandatory++;
+            }
             var share = new ulong[4];
             for (var limb = 0; limb < 4; limb++)
             {
@@ -473,6 +591,14 @@ internal static class SLHwidCore
         if (offset != body.Length)
         {
             throw Corrupt("trailing bytes");
+        }
+        if (actualMandatory != mandatoryHeader)
+        {
+            throw Corrupt("mandatory count mismatch");
+        }
+        if (!helper.Slots.Any(slot => slot.Name == "slstore" && slot.Mandatory))
+        {
+            throw Corrupt("mandatory slstore missing");
         }
         return helper;
     }
