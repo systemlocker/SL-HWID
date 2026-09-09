@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <ctime>
 #include <cstdio>
@@ -471,11 +472,28 @@ namespace slhwid::detail
             Read read(const std::string &key) override
             {
                 Read result;
-                std::ifstream file(pathFor(key), std::ios::binary);
+                const std::string path = pathFor(key);
+                std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+                    std::fopen(path.c_str(), "rb"), &std::fclose);
                 if (!file)
-                    return result; // absent
-                result.data = std::vector<unsigned char>((std::istreambuf_iterator<char>(file)),
-                                                         std::istreambuf_iterator<char>());
+                {
+                    // Only a missing file permits enrollment. A sharing or
+                    // permission failure must not replace an existing HWID.
+                    const int code = errno;
+                    if (code != ENOENT)
+                        result.error = "cannot open " + path + ": " + std::strerror(code);
+                    return result;
+                }
+                std::vector<unsigned char> data;
+                std::array<unsigned char, 4096> buffer{};
+                while (const std::size_t count = std::fread(buffer.data(), 1, buffer.size(), file.get()))
+                    data.insert(data.end(), buffer.begin(), buffer.begin() + count);
+                if (std::ferror(file.get()))
+                {
+                    result.error = "cannot read " + path;
+                    return result;
+                }
+                result.data = std::move(data);
                 return result;
             }
 
@@ -769,9 +787,10 @@ namespace slhwid::detail
 #if defined(_WIN32)
                     HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(processId));
                     if (process == nullptr)
-                        return GetLastError() != ERROR_ACCESS_DENIED;
-                    DWORD exitCode = 0;
-                    const bool dead = !GetExitCodeProcess(process, &exitCode) || exitCode != STILL_ACTIVE;
+                        return GetLastError() == ERROR_INVALID_PARAMETER;
+                    // SYNCHRONIZE allows waiting, not querying an exit code.
+                    // A failed liveness check is never evidence of termination.
+                    const bool dead = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
                     CloseHandle(process);
                     return dead;
 #else

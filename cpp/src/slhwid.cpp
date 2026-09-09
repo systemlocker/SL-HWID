@@ -919,12 +919,15 @@ namespace slhwid::detail
             {
                 if (depth == need)
                 {
-                    if (found.empty())
-                    {
-                        const Key k = keyFromPoints(points);
-                        if (ctEqual(checkWord(k), cw))
-                            found = points;
-                    }
+                    // Keep doing the cryptographic work after the first match;
+                    // walking the remaining combinations alone leaks its position.
+                    Key k = keyFromPoints(points);
+                    auto candidate = checkWord(k);
+                    const bool matches = ctEqual(candidate, cw);
+                    if (matches && found.empty())
+                        found = points;
+                    secureWipe(k.data(), sizeof(k));
+                    secureWipe(candidate.data(), candidate.size());
                     return;
                 }
                 for (int i = start; i <= static_cast<int>(optional.size()) - (need - depth); ++i)
@@ -1020,7 +1023,8 @@ namespace slhwid::detail
                     (isMandatorySlot(helper, point.name) ? mand2 : opt2).push_back(point);
                 }
                 std::vector<Point> ignored;
-                if (culprit.empty() && findRecoveringSubset(mand2, opt2, t, helper.checkWord, ignored))
+                const bool recovers = findRecoveringSubset(mand2, opt2, t, helper.checkWord, ignored);
+                if (recovers && culprit.empty())
                     culprit = ms.name;
             }
             if (!culprit.empty())
@@ -1057,8 +1061,8 @@ namespace slhwid::detail
             }
             const std::uint64_t xq = deriveX(slot.name, it->second, helper.salt);
             bool onCurve = true;
-            for (int limb = 0; limb < 4 && onCurve; ++limb)
-                onCurve = evaluateAt(found, limb, xq) == slot.share[limb];
+            for (int limb = 0; limb < 4; ++limb)
+                onCurve &= evaluateAt(found, limb, xq) == slot.share[limb];
             (onCurve ? result.live : result.dead).push_back(slot.name);
         }
         std::sort(result.live.begin(), result.live.end());
@@ -1074,6 +1078,15 @@ namespace slhwid::detail
                               Draw &draw)
     {
         RefreshResult result;
+        // A mapped hard lock may be absent from the new projection. Keep the
+        // old helper until it is available; counting only present locks would
+        // silently remove that requirement from the next enrollment.
+        for (const auto &name : mandatory)
+        {
+            const auto it = factors.find(name);
+            if (it == factors.end() || it->second.empty())
+                return result;
+        }
         const auto slots = slotList(factors, mandatory);
         int m = 0;
         for (const auto &slot : slots)
@@ -1110,12 +1123,19 @@ namespace slhwid::detail
                    std::to_string(result.needed) + " needed); re-activation required";
         }
 
-        std::optional<std::vector<unsigned char>> unwrapSlstore(const std::vector<unsigned char> &data)
+        std::optional<std::vector<unsigned char>> unwrapSlstore(const std::vector<unsigned char> &data,
+                                                               std::string &error)
         {
             if (data.size() != kSlstorePrefixLength + 32)
-                throw std::runtime_error(std::string(kCorruptPrefix) + ": store secret has the wrong size");
+            {
+                error = std::string(kCorruptPrefix) + ": store secret has the wrong size";
+                return std::nullopt;
+            }
             if (std::memcmp(data.data(), kSlstorePrefix, kSlstorePrefixLength) != 0)
-                throw std::runtime_error(std::string(kCorruptPrefix) + ": store secret prefix mismatch");
+            {
+                error = std::string(kCorruptPrefix) + ": store secret prefix mismatch";
+                return std::nullopt;
+            }
             return std::vector<unsigned char>(data.begin() + kSlstorePrefixLength, data.end());
         }
 
@@ -1186,7 +1206,10 @@ namespace slhwid::detail
                                              "slhwid: store secret read failed: " + stored.error);
             if (stored.data)
             {
-                auto value = unwrapSlstore(*stored.data);
+                std::string error;
+                auto value = unwrapSlstore(*stored.data, error);
+                if (!value)
+                    return Result<Session>::fail(ErrorKind::LocalFailure, error);
                 rawFactors["slstore"] = toLowerHex(*value);
             }
         }
@@ -1206,7 +1229,10 @@ namespace slhwid::detail
                 std::vector<unsigned char> value;
                 if (stored.data)
                 {
-                    auto existingValue = unwrapSlstore(*stored.data);
+                    std::string error;
+                    auto existingValue = unwrapSlstore(*stored.data, error);
+                    if (!existingValue)
+                        return Result<Session>::fail(ErrorKind::LocalFailure, error);
                     value = *existingValue;
                 }
                 else
@@ -1289,8 +1315,6 @@ namespace slhwid::detail
                                              std::string(kCorruptPrefix) + "; re-enroll to recover");
             return Result<Session>::fail(ErrorKind::LocalFailure, driftMessage(recovered));
         }
-        state->key = recovered.key;
-        state->hasKey = true;
         state->expectedHelper = *existing.data;
         // A second application must not weaken a hard lock selected by the
         // application that enrolled the shared device helper.
@@ -1300,7 +1324,35 @@ namespace slhwid::detail
                 storedMandatory.insert(slot.name);
         state->factors = projectFactors(rawFactors, kCurrentNormVersion);
         state->mandatory = mapMandatoryToCurrent(storedMandatory);
-        return Session(recovered.hwid, false, recovered.dead, recovered.pending, state);
+        const auto changed = mapMandatoryToCurrent(std::set<std::string>(recovered.dead.begin(), recovered.dead.end()));
+        bool policyChanged = false;
+        for (const auto &name : mapMandatoryToCurrent(requestedMandatory))
+        {
+            if (state->mandatory.count(name) != 0)
+                continue;
+            // A previously enrolled optional factor must still match before
+            // it can become mandatory. A newly available factor is bound by
+            // Commit, after authorization, without replacing the device key.
+            const auto value = state->factors.find(name);
+            if (value == state->factors.end() || value->second.empty() || changed.count(name) != 0)
+            {
+                secureWipe(recovered.key.data(), sizeof(recovered.key));
+                return Result<Session>::fail(ErrorKind::LocalFailure,
+                    "slhwid: mandatory factor(s) " + name + " changed or absent; re-activation required");
+            }
+            state->mandatory.insert(name);
+            policyChanged = true;
+        }
+        if (policyChanged && state->mandatory.size() >= state->factors.size())
+        {
+            secureWipe(recovered.key.data(), sizeof(recovered.key));
+            return Result<Session>::fail(ErrorKind::Configuration,
+                "slhwid: mandatory slots must be fewer than total factors");
+        }
+        state->key = recovered.key;
+        state->hasKey = true;
+        secureWipe(recovered.key.data(), sizeof(recovered.key));
+        return Session(recovered.hwid, false, recovered.dead, recovered.pending || policyChanged, state);
     }
 }
 

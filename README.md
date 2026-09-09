@@ -99,6 +99,11 @@ changing mandatory slots affects every application that shares the store.
 - Existing schema-v1 helpers remain recoverable. After successful
   authorization, `Commit` rewrites the helper with the current schema while
   preserving the HWID.
+- `ExtraMandatory` / `extraMandatory` also applies to an existing helper.
+  An enrolled factor must still match before it can become mandatory. A
+  newly available factor is bound when `Commit` succeeds after authorization.
+  Added locks preserve the HWID and apply to every application sharing the
+  store; omitting them in a later call does not remove them.
 - The persisted formats, helper name, and lock marker are identical across
   the C++ and C# implementations and across platforms.
 

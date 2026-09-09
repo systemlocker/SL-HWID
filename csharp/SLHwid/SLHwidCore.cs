@@ -691,10 +691,17 @@ internal static class SLHwidCore
         {
             if (depth == need)
             {
-                if (match is null && CtEqual(CheckWord(KeyFromPoints(result)), cw))
+                // Every candidate still needs interpolation and hashing after
+                // a match; otherwise elapsed work reveals the matching subset.
+                var key = KeyFromPoints(result);
+                var candidate = CheckWord(key);
+                var matches = CtEqual(candidate, cw);
+                if (matches && match is null)
                 {
                     match = (Point[])result.Clone();
                 }
+                Array.Clear(key);
+                Wipe(candidate);
                 return;
             }
             for (var i = start; i <= optional.Length - (need - depth); i++)
@@ -775,7 +782,8 @@ internal static class SLHwidCore
                 var merged = mandatory.Concat(optional).Where(p => p.Name != ms.Name).ToList();
                 var mand2 = merged.Where(p => IsMandatorySlot(helper, p.Name)).ToArray();
                 var opt2 = merged.Where(p => !IsMandatorySlot(helper, p.Name)).ToArray();
-                if (culprit is null && FindRecoveringSubset(mand2, opt2, t, helper.CheckWord) is not null)
+                var recovers = FindRecoveringSubset(mand2, opt2, t, helper.CheckWord) is not null;
+                if (recovers && culprit is null)
                 {
                     culprit = ms.Name;
                 }
@@ -814,11 +822,7 @@ internal static class SLHwidCore
             var onCurve = true;
             for (var limb = 0; limb < 4; limb++)
             {
-                if (EvaluateAt(found, limb, xq) != slot.Share[limb])
-                {
-                    onCurve = false;
-                    break;
-                }
+                onCurve &= EvaluateAt(found, limb, xq) == slot.Share[limb];
             }
             (onCurve ? live : dead).Add(slot.Name);
         }
@@ -836,6 +840,12 @@ internal static class SLHwidCore
     // Re-shares k over the current factors; (null, false) when skipped.
     public static (byte[]? Blob, bool Written) RefreshCore(ulong[] k, Dictionary<string, string> factors, HashSet<string> mandatory, Draw d)
     {
+        // Missing mapped locks must postpone refresh, never disappear from
+        // the serialized policy just because they have no current slot.
+        if (mandatory.Any(name => !factors.TryGetValue(name, out var value) || value.Length == 0))
+        {
+            return (null, false);
+        }
         var slots = SlotList(factors, mandatory);
         var m = slots.Count(s => s.Mandatory);
         int t;

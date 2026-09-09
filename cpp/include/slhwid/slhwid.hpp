@@ -79,7 +79,9 @@ namespace slhwid
         std::string storePath;
 
         /// Names additional hard-locked slots beyond the default "slstore"
-        /// (for example, "machine_guid").
+        /// (for example, "machine_guid"). Existing enrolled factors must still
+        /// match. Added locks persist on commit without changing the HWID;
+        /// existing locks are preserved.
         std::vector<std::string> extraMandatory;
 
         /// Discards shared device helper data and enrolls a fresh key (new
@@ -114,7 +116,7 @@ namespace slhwid
         /// Enrolled slots that were dead at prepare time.
         const std::vector<std::string> &driftedSlots() const noexcept;
 
-        /// Whether any slot was dead (commit will re-center).
+        /// Whether hardware drift or added hard locks need a refresh.
         bool pendingRefresh() const noexcept;
 
         /// Re-shares the recovered key over the hardware observed at prepare

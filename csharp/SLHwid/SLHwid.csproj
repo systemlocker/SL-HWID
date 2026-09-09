@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>SLHwid</PackageId>
-    <Version>1.0.0</Version>
+    <Version>2.0.2</Version>
     <Authors>System Locker</Authors>
     <Description>Fault-tolerant, cross-platform hardware fingerprint — 14 hardware factors by default, any two can fail without changing the identifier.</Description>
     <PackageProjectUrl>https://github.com/systemlocker/SL-HWID</PackageProjectUrl>

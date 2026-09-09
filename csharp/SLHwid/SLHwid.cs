@@ -11,7 +11,9 @@ public sealed class SLHwidOptions
     /// platform). Empty uses the platform default.</summary>
     public string StorePath { get; init; } = "";
 
-    /// <summary>Names additional hard-locked slots beyond the default "slstore".</summary>
+    /// <summary>Names additional hard-locked slots beyond the default "slstore".
+    /// Existing enrolled factors must still match. Added locks are persisted
+    /// on Commit without changing the HWID; existing locks are preserved.</summary>
     public IReadOnlyList<string> ExtraMandatory { get; init; } = Array.Empty<string>();
 
     /// <summary>Discards the shared device helper data and enrolls a fresh
@@ -67,7 +69,7 @@ public sealed class SLHwidSession
     /// <summary>Enrolled slots that were dead at prepare time.</summary>
     public IReadOnlyList<string> DriftedSlots { get; private set; }
 
-    /// <summary>Whether any slot was dead (commit will re-center).</summary>
+    /// <summary>Whether hardware drift or added hard locks need a refresh.</summary>
     public bool PendingRefresh { get; private set; }
 
     internal ulong[]? Key { get; private set; }
@@ -240,7 +242,27 @@ public static class SLHwid
         var storedMandatory = SLHwidCore.MapMandatoryToCurrent(
             helper.Slots.Where(slot => slot.Mandatory).Select(slot => slot.Name));
         var currentFactors = SLHwidCore.ProjectFactors(rawFactors, SLHwidCore.CurrentNormVersion);
-        return new SLHwidSession(result.Hwid, false, result.Dead, result.Pending,
+        var additionalMandatory = SLHwidCore.MapMandatoryToCurrent(requestedMandatory);
+        additionalMandatory.ExceptWith(storedMandatory);
+        // Promoting an enrolled optional slot must not absorb a change to it.
+        // Newly available slots are bound after authorization by Commit.
+        var changed = SLHwidCore.MapMandatoryToCurrent(result.Dead);
+        var unavailable = additionalMandatory.Where(name =>
+            !currentFactors.TryGetValue(name, out var value) || value.Length == 0 || changed.Contains(name))
+            .Order(StringComparer.Ordinal).ToArray();
+        if (unavailable.Length > 0)
+        {
+            Array.Clear(result.Key!);
+            throw new SLHwidDriftException(
+                helper.Slots.Count(slot => recoveryFactors.ContainsKey(slot.Name)), helper.Threshold, unavailable, true);
+        }
+        storedMandatory.UnionWith(additionalMandatory);
+        if (additionalMandatory.Count > 0 && storedMandatory.Count >= currentFactors.Count)
+        {
+            Array.Clear(result.Key!);
+            throw new InvalidOperationException("slhwid: mandatory slots must be fewer than total factors");
+        }
+        return new SLHwidSession(result.Hwid, false, result.Dead, result.Pending || additionalMandatory.Count > 0,
             result.Key!, new Draw(source), currentFactors, storedMandatory, store, existing);
     }
 
