@@ -45,6 +45,14 @@
 
 namespace slhwid::detail
 {
+    void mergeWindowsFactors(std::map<std::string, std::string> &factors,
+                             const std::map<std::string, std::string> &fallback)
+    {
+        for (const auto &[name, value] : fallback)
+            if (factors.count(name) == 0 && !value.empty())
+                factors[name] = value;
+    }
+
     RegistryRootSelection selectRegistryRoot(bool machineHelper, bool machineSlstore,
                                              bool userHelper, bool userSlstore)
     {
@@ -1184,11 +1192,11 @@ namespace slhwid::detail
                 factors[slot] = *value;
         }
 
-        std::map<std::string, std::string> windowsSchemaV2Factors()
+        std::map<std::string, std::string> windowsSchemaV2Factors(bool includeTpm)
         {
             // Use one bounded CIM query for enrichment. Native sources remain
             // authoritative, and explicit UTF-8 keeps non-ASCII values stable.
-            const std::string script =
+            std::string script =
                 "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;$ErrorActionPreference='SilentlyContinue';"
                 "function Emit($n,$v){$c=@($v|?{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|%{([string]$_).Trim()}|sort);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};"
                 "$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;"
@@ -1196,8 +1204,11 @@ namespace slhwid::detail
                 "Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;"
                 "Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;"
                 "Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress;"
-                "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;"
-                "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}";
+                "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;";
+            // Retain the PowerShell path when native access is unavailable.
+            // Its fingerprint is identical, including for existing stores.
+            if (includeTpm)
+                script += "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}";
             const auto output = popenCapture(
                 "powershell.exe -NoProfile -NonInteractive -Command \"" + script + "\" 2>nul", 6000);
             std::map<std::string, std::string> factors;
@@ -1285,17 +1296,12 @@ namespace slhwid::detail
 
         put(factors, "volume_id", volumeSerial());
         put(factors, "mac", physicalMac());
+        const auto nativeTpm = nativeTpmFactor();
+        put(factors, "tpm_ek", nativeTpm);
 
         // Schema-v2 signals. Legacy collection remains above because schema-v1
         // helpers still need the original values during migration recovery.
-        for (const auto &[name, value] : windowsSchemaV2Factors())
-        {
-            // Native sources define the cross-language representation. CIM is
-            // fallback/enrichment only and must never overwrite a value just
-            // because PowerShell happened to work on this launch.
-            if (factors.count(name) == 0)
-                put(factors, name, value);
-        }
+        mergeWindowsFactors(factors, windowsSchemaV2Factors(!nativeTpm.has_value()));
 
         return factors;
     }

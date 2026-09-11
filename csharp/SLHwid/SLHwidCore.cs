@@ -256,6 +256,11 @@ internal static class SLHwidCore
         foreach (var (name, value) in raw)
         {
             var nv = Normalize(name, value);
+            // A module with an OEM placeholder must not erase the usable RAM
+            // serials beside it. Preserve order and duplicates so previously
+            // accepted inventories keep exactly the same enrolled value.
+            if (name == "memory_modules" && Encoding.UTF8.GetByteCount(nv) <= 4096)
+                nv = string.Join("|", nv.Split('|').Where(part => IsSaneFactor(name, part)));
             if (IsSaneFactor(name, nv))
             {
                 output[name] = nv;

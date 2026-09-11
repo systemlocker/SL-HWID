@@ -69,7 +69,7 @@ public sealed class SLHwidSession
     /// <summary>Enrolled slots that were dead at prepare time.</summary>
     public IReadOnlyList<string> DriftedSlots { get; private set; }
 
-    /// <summary>Whether hardware drift or added hard locks need a refresh.</summary>
+    /// <summary>Whether hardware drift, newly available factors, or added hard locks need a refresh.</summary>
     public bool PendingRefresh { get; private set; }
 
     internal ulong[]? Key { get; private set; }
@@ -262,7 +262,11 @@ public static class SLHwid
             Array.Clear(result.Key!);
             throw new InvalidOperationException("slhwid: mandatory slots must be fewer than total factors");
         }
-        return new SLHwidSession(result.Hwid, false, result.Dead, result.Pending || additionalMandatory.Count > 0,
+        // A newly readable optional source also needs a post-authorization
+        // refresh, even if every previously enrolled share still matches.
+        var addedFactors = helper.NormVersion == SLHwidCore.CurrentNormVersion &&
+            currentFactors.Keys.Except(helper.Slots.Select(slot => slot.Name)).Any();
+        return new SLHwidSession(result.Hwid, false, result.Dead, result.Pending || additionalMandatory.Count > 0 || addedFactors,
             result.Key!, new Draw(source), currentFactors, storedMandatory, store, existing);
     }
 

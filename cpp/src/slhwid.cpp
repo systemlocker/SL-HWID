@@ -499,7 +499,27 @@ namespace slhwid::detail
         std::map<std::string, std::string> out;
         for (const auto &[name, value] : raw)
         {
-            const std::string normalized = normalize(name, value);
+            std::string normalized = normalize(name, value);
+            if (name == "memory_modules" && normalized.size() <= 4096)
+            {
+                // Keep usable modules beside OEM placeholders. Do not sort or
+                // deduplicate: already accepted inventories must stay identical.
+                std::string usable;
+                std::size_t begin = 0;
+                do
+                {
+                    const auto end = normalized.find('|', begin);
+                    const auto part = normalized.substr(begin, end == std::string::npos ? end : end - begin);
+                    if (saneFactor(name, part))
+                    {
+                        if (!usable.empty()) usable += '|';
+                        usable += part;
+                    }
+                    if (end == std::string::npos) break;
+                    begin = end + 1;
+                } while (begin <= normalized.size());
+                normalized = std::move(usable);
+            }
             if (saneFactor(name, normalized))
                 out[name] = normalized;
         }
@@ -1352,7 +1372,15 @@ namespace slhwid::detail
         state->key = recovered.key;
         state->hasKey = true;
         secureWipe(recovered.key.data(), sizeof(recovered.key));
-        return Session(recovered.hwid, false, recovered.dead, recovered.pending || policyChanged, state);
+        // Newly available optional sources need a post-authorization refresh
+        // even when all previously enrolled shares still match.
+        const bool addedFactors = helper.normVersion == kCurrentNormVersion &&
+            std::any_of(state->factors.begin(), state->factors.end(), [&helper](const auto &factor) {
+                return std::none_of(helper.slots.begin(), helper.slots.end(), [&factor](const auto &slot) {
+                    return slot.name == factor.first;
+                });
+            });
+        return Session(recovered.hwid, false, recovered.dead, recovered.pending || policyChanged || addedFactors, state);
     }
 }
 

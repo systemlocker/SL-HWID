@@ -16,11 +16,13 @@ internal static class SLHwidCollectors
 {
     private const string DisplayClassGuid = "{4d36e968-e325-11ce-bfc1-08002be10318}";
 
-    public static Dictionary<string, string> Collect()
+    public static Dictionary<string, string> Collect() => Collect(null);
+
+    internal static Dictionary<string, string> Collect(Action<string, string>? diagnostic)
     {
         if (OperatingSystem.IsWindows())
         {
-            return CollectWindows();
+            return CollectWindows(diagnostic);
         }
         if (OperatingSystem.IsMacOS())
         {
@@ -39,7 +41,7 @@ internal static class SLHwidCollectors
     // ── Windows ────────────────────────────────────────────────────
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static Dictionary<string, string> CollectWindows()
+    private static Dictionary<string, string> CollectWindows(Action<string, string>? diagnostic)
     {
         var factors = new Dictionary<string, string>();
         var bios = @"HARDWARE\DESCRIPTION\System\BIOS";
@@ -72,10 +74,19 @@ internal static class SLHwidCollectors
         Put(factors, "ram_total", RamTotal());
         Put(factors, "volume_id", VolumeSerial());
         Put(factors, "mac", MacAddress());
+        var nativeTpm = SLHwidTpm.CollectNative(out var tpmDetail);
+        Put(factors, "tpm_ek", nativeTpm);
+        diagnostic?.Invoke("tpm_ek", tpmDetail);
 
         // Schema-v2 signals. The legacy signals above intentionally remain:
         // existing schema-v1 helpers still need their original values to recover.
-        foreach (var (name, value) in WindowsSchemaV2Factors())
+        MergeWindowsFactors(factors, WindowsSchemaV2Factors(nativeTpm is null, diagnostic));
+        return factors;
+    }
+
+    internal static void MergeWindowsFactors(Dictionary<string, string> factors, Dictionary<string, string> fallback)
+    {
+        foreach (var (name, value) in fallback)
         {
             // Native values define the cross-language representation. CIM is
             // strictly a fallback/enrichment source and must not overwrite a
@@ -85,7 +96,6 @@ internal static class SLHwidCollectors
                 Put(factors, name, value);
             }
         }
-        return factors;
     }
 
     private static void Put(Dictionary<string, string> factors, string slot, string? value)
@@ -400,12 +410,12 @@ internal static class SLHwidCollectors
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static Dictionary<string, string> WindowsSchemaV2Factors()
+    private static Dictionary<string, string> WindowsSchemaV2Factors(bool includeTpm, Action<string, string>? diagnostic)
     {
         // One PowerShell process obtains the CIM-backed SMBIOS/peripheral
         // signals. UTF-8 output keeps non-ASCII hardware strings identical to
         // the native C++ collector. WMIC is never invoked.
-        const string script =
+        var script =
             "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;$ErrorActionPreference='SilentlyContinue';" +
             "function Emit($n,$v){$c=@($v|?{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|%{([string]$_).Trim()}|sort);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};" +
             "$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;" +
@@ -413,8 +423,14 @@ internal static class SLHwidCollectors
             "Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;" +
             "Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;" +
             "Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress;" +
-            "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;" +
-            "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}";
+            "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;";
+        // Both paths use the same fingerprint. A store created through the
+        // PowerShell fallback automatically recovers natively when available.
+        if (includeTpm)
+            script += "try{$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256 -ErrorAction Stop;" +
+                "if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash;'tpm_status=PowerShell fallback: endorsement key available.'}" +
+                "elseif($ek -is [string]){'tpm_status=PowerShell fallback: '+$ek}" +
+                "else{'tpm_status=PowerShell fallback: endorsement key unavailable.'}}catch{'tpm_status=PowerShell fallback: '+$_.Exception.Message}";
         var factors = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var line in Run("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 6)
                      .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -422,6 +438,11 @@ internal static class SLHwidCollectors
             var separator = line.IndexOf('=');
             if (separator > 0 && separator + 1 < line.Length)
             {
+                if (line[..separator] == "tpm_status")
+                {
+                    diagnostic?.Invoke("tpm_ek", line[(separator + 1)..]);
+                    continue;
+                }
                 factors[line[..separator]] = line[(separator + 1)..];
             }
         }

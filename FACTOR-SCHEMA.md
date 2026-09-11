@@ -39,6 +39,12 @@ placeholder components, and values made entirely of zeroes or `f`s. These
 checks are deliberately conservative: they catch unit mistakes and sentinel
 data without trying to guess vendor-specific serial-number formats.
 
+`memory_modules` filters invalid serials individually and retains the usable
+modules as one slot. Already valid inventories retain their existing order and
+duplicates. The 4096-byte input limit still applies before filtering. A newly
+usable inventory joins an existing enrollment only on a successful `Commit`;
+the recovered HWID stays unchanged.
+
 The percentage policy is `ceil(80% × slots)` below eight slots and
 `ceil(70% × slots)` from eight upward. New enrollment and re-centering require
 at least eight slots, so current helpers begin on the 70% branch. The threshold
@@ -107,6 +113,15 @@ SMBIOS Type-1 UUID read through `GetSystemFirmwareTable`; it is not Windows'
 derived `ComputerHardwareId`. Do not introduce a WMIC dependency: the utility
 is absent on current Windows installations. CIM-based signals are optional,
 bounded enrichment and never overwrite a value obtained natively.
+
+On Windows, TPM identity first uses the Platform Crypto Provider's `PCP_EKPUB`
+property. Its RSA public blob is encoded as ASN.1 `RSAPublicKey` and hashed with
+SHA-256, matching `Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256`. PowerShell
+remains the fallback if native reading or encoding fails. Existing TPM shares
+therefore recover through either source without changing their value or the
+helper format. When native access becomes available, collection switches to it
+automatically; a previously unavailable TPM can be added on `Commit` after
+successful authentication. Native queries are silent and never request elevation.
 
 Treat collected values as device identifiers: do not log them, send them to a
 server, or expose them in error messages. The helper stores threshold shares,

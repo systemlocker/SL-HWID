@@ -165,6 +165,10 @@ namespace slhwid::detail
         const std::vector<unsigned char> &descriptor, std::size_t returned);
     bool acquireStorageLock(const std::string &directory, std::function<void()> &release, std::string &error);
     std::map<std::string, std::string> collectFactors(std::string &error);
+    std::optional<std::string> nativeTpmFactor();
+    void mergeWindowsFactors(std::map<std::string, std::string> &factors,
+                             const std::map<std::string, std::string> &fallback);
+    std::optional<std::string> hashTpmPublicBlob(const std::vector<unsigned char> &blob);
 
     struct SessionState
     {

@@ -116,7 +116,7 @@ namespace slhwid
         /// Enrolled slots that were dead at prepare time.
         const std::vector<std::string> &driftedSlots() const noexcept;
 
-        /// Whether hardware drift or added hard locks need a refresh.
+        /// Whether drift, newly available factors, or added hard locks need a refresh.
         bool pendingRefresh() const noexcept;
 
         /// Re-shares the recovered key over the hardware observed at prepare

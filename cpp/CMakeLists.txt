@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(SLHwid VERSION 1.0.0 LANGUAGES CXX)
+project(SLHwid VERSION 2.1.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -20,6 +20,7 @@ endif()
 add_library(slhwid ${SLHWID_LIBRARY_TYPE}
     src/slhwid.cpp
     src/slhwid_platform.cpp
+    src/slhwid_tpm.cpp
 )
 add_library(SLHwid::slhwid ALIAS slhwid)
 set_target_properties(slhwid PROPERTIES EXPORT_NAME slhwid)
@@ -37,7 +38,7 @@ if(NOT SLHWID_STATIC)
 endif()
 
 if(WIN32)
-    target_link_libraries(slhwid PRIVATE bcrypt iphlpapi)
+    target_link_libraries(slhwid PRIVATE bcrypt iphlpapi ncrypt crypt32)
 endif()
 
 if(MSVC)
