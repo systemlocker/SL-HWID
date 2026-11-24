@@ -35,8 +35,18 @@ internal enum RegistryRootSelection
 internal static class RegistryRootPolicy
 {
     internal static RegistryRootSelection Select(
-        bool machineHelper, bool machineSlstore, bool userHelper, bool userSlstore)
+        bool machineHelper, bool machineSlstore, bool userHelper, bool userSlstore) =>
+        Select(machineHelper, machineSlstore, userHelper, userSlstore, userMirrorsMachine: false);
+
+    // userMirrorsMachine: both hives hold the same store secret, so the user
+    // hive is a per-user copy of the machine generation (same key and HWID)
+    // that a non-elevated process wrote because it cannot update HKLM. That
+    // copy is the one this user can keep refreshed, so it wins.
+    internal static RegistryRootSelection Select(
+        bool machineHelper, bool machineSlstore, bool userHelper, bool userSlstore, bool userMirrorsMachine)
     {
+        if (machineHelper && machineSlstore && userHelper && userSlstore && userMirrorsMachine)
+            return RegistryRootSelection.User;
         if (machineHelper && machineSlstore) return RegistryRootSelection.Machine;
         if (userHelper && userSlstore) return RegistryRootSelection.User;
         if (machineHelper) return RegistryRootSelection.Machine;
@@ -52,7 +62,9 @@ internal static class SLHwidStore
     private const string LockFileName = ".slhwid.lock";
     private const string LockHeader = "SLHwidLockV1";
     private static readonly TimeSpan LockWait = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan UnknownLockGrace = TimeSpan.FromMinutes(2);
+    // Holders keep the marker for milliseconds (factor collection happens
+    // outside the lock), so any older marker has been abandoned.
+    private static readonly TimeSpan StaleLockAge = TimeSpan.FromMinutes(2);
 
     public static ISSStore CreateDefault(string overridePath) =>
         overridePath.Length > 0 ? new DirStore(overridePath) : CreatePlatformDefault();
@@ -64,9 +76,13 @@ internal static class SLHwidStore
             return new RegistryStore();
         }
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        // An empty XDG_DATA_HOME means "unset" (as in the C++ implementation).
+        // Path.Combine("", ...) would otherwise yield a store relative to the
+        // working directory, which re-enrolls whenever the app starts elsewhere.
+        var xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
         var directory = OperatingSystem.IsMacOS()
             ? Path.Combine(home, "Library", "Application Support", "SystemLocker")
-            : Path.Combine(Environment.GetEnvironmentVariable("XDG_DATA_HOME") ?? Path.Combine(home, ".local", "share"), "systemlocker");
+            : Path.Combine(string.IsNullOrEmpty(xdg) ? Path.Combine(home, ".local", "share") : xdg, "systemlocker");
         return new DirStore(directory);
     }
 
@@ -96,6 +112,7 @@ internal static class SLHwidStore
         var lockPath = Path.Join(directory, LockFileName);
         var owner = $"{LockHeader}\n{Environment.ProcessId}\n{Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant()}\n";
         var deadline = DateTime.UtcNow + LockWait;
+        var deniedAttempts = 0;
         while (true)
         {
             try
@@ -107,8 +124,15 @@ internal static class SLHwidStore
                 file.Flush(flushToDisk: true);
                 return new FileLock(lockPath, owner);
             }
-            catch (IOException)
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
+                // Windows reports a marker that another process is deleting
+                // as "access denied" instead of "exists". That state lasts
+                // milliseconds; a persistent denial is a real permission error.
+                if (error is UnauthorizedAccessException && ++deniedAttempts > 20)
+                {
+                    throw;
+                }
                 var existing = ReadLock(lockPath);
                 if (existing is not null && IsStale(lockPath, existing.Value.ProcessId))
                 {
@@ -117,7 +141,7 @@ internal static class SLHwidStore
                 }
                 if (DateTime.UtcNow >= deadline)
                 {
-                    throw new IOException("slhwid: storage is busy; retry the operation");
+                    throw new IOException("slhwid: storage is busy; retry the operation", error);
                 }
                 Thread.Sleep(50);
             }
@@ -146,7 +170,7 @@ internal static class SLHwidStore
             }
             return (contents, null);
         }
-        catch (IOException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
             return null;
         }
@@ -154,43 +178,67 @@ internal static class SLHwidStore
 
     private static bool IsStale(string path, int? processId)
     {
-        if (processId is not null)
+        if (processId is not null && !ProcessMayBeAlive(processId.Value))
         {
-            try
-            {
-                return Process.GetProcessById(processId.Value).HasExited;
-            }
-            catch (ArgumentException)
-            {
-                return true;
-            }
-            catch (InvalidOperationException)
-            {
-                return false;
-            }
+            return true;
         }
+        // A live-looking PID can belong to an unrelated process after PID
+        // reuse, or to a holder that failed to delete its marker. Without this
+        // age limit such a marker would block the store until that process exits.
         try
         {
-            return DateTime.UtcNow - File.GetLastWriteTimeUtc(path) >= UnknownLockGrace;
+            return DateTime.UtcNow - File.GetLastWriteTimeUtc(path) >= StaleLockAge;
         }
-        catch (IOException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
             return false;
         }
     }
 
-    private static void RemoveIfUnchanged(string path, string expected)
+    private static bool ProcessMayBeAlive(int processId)
     {
         try
         {
-            if (File.ReadAllText(path) == expected)
-            {
-                File.Delete(path);
-            }
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
         }
-        catch (IOException)
+        catch (ArgumentException)
         {
-            // Another process released or recovered the marker.
+            return false; // no such process
+        }
+        catch (Exception error) when (error is InvalidOperationException
+                                          or System.ComponentModel.Win32Exception
+                                          or NotSupportedException)
+        {
+            // Access to another user's process can be denied. A failed check
+            // is not evidence of termination; the age limit still applies.
+            return true;
+        }
+    }
+
+    private static void RemoveIfUnchanged(string path, string expected)
+    {
+        // On Windows, deleting fails while another process is reading the
+        // marker. Giving up would leave a marker that names a live process,
+        // so retry briefly; the contents check stops if it was replaced.
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            try
+            {
+                if (File.ReadAllText(path) == expected)
+                {
+                    File.Delete(path);
+                }
+                return;
+            }
+            catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
+            {
+                return; // Another process released or recovered the marker.
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                Thread.Sleep(10);
+            }
         }
     }
 
@@ -356,16 +404,26 @@ internal sealed class RegistryStore : ISSStore, ISSStoreLockable
         WriteSelected("HWID-device", blob);
     }
 
+    // Only a well-formed secret completes a generation. A malformed HKLM
+    // secret that a non-elevated ForceReenroll could not overwrite must not
+    // outrank the replacement generation it wrote to HKCU.
+    internal static bool IsWellFormedSlstore(byte[]? data) =>
+        data is not null && data.Length == SLHwidCore.SlstorePrefix.Length + 32
+        && data.AsSpan(0, SLHwidCore.SlstorePrefix.Length).SequenceEqual(SLHwidCore.SlstorePrefix);
+
     private Microsoft.Win32.RegistryHive? SelectHive()
     {
         // A helper and its mandatory store secret form one generation. Never
         // choose the two values independently across HKLM/HKCU: that can make
         // valid data look corrupt after an elevation or reinstall change.
+        var machineSlstore = Read(Microsoft.Win32.RegistryHive.LocalMachine, "SLStore");
+        var userSlstore = Read(Microsoft.Win32.RegistryHive.CurrentUser, "SLStore");
         var selected = RegistryRootPolicy.Select(
             Read(Microsoft.Win32.RegistryHive.LocalMachine, "HWID-device") is not null,
-            Read(Microsoft.Win32.RegistryHive.LocalMachine, "SLStore") is not null,
+            IsWellFormedSlstore(machineSlstore),
             Read(Microsoft.Win32.RegistryHive.CurrentUser, "HWID-device") is not null,
-            Read(Microsoft.Win32.RegistryHive.CurrentUser, "SLStore") is not null);
+            IsWellFormedSlstore(userSlstore),
+            IsWellFormedSlstore(machineSlstore) && machineSlstore!.AsSpan().SequenceEqual(userSlstore));
         _selectedHive = selected switch
         {
             RegistryRootSelection.Machine => Microsoft.Win32.RegistryHive.LocalMachine,
@@ -379,11 +437,24 @@ internal sealed class RegistryStore : ISSStore, ISSStoreLockable
     {
         if (_selectedHive is { } selected)
         {
-            if (!Write(selected, name, data))
+            if (Write(selected, name, data))
             {
-                throw new IOException("slhwid: registry write failed");
+                return;
             }
-            return;
+            // A non-elevated process cannot update an HKLM generation that an
+            // elevated one created. Continue in HKCU instead of never absorbing
+            // drift again: copying the machine secret first makes the user
+            // hive a complete mirror with the same key, so the HWID is kept.
+            if (selected == Microsoft.Win32.RegistryHive.LocalMachine
+                && (name == "SLStore"
+                    || Read(Microsoft.Win32.RegistryHive.LocalMachine, "SLStore") is { } secret
+                    && Write(Microsoft.Win32.RegistryHive.CurrentUser, "SLStore", secret))
+                && Write(Microsoft.Win32.RegistryHive.CurrentUser, name, data))
+            {
+                _selectedHive = Microsoft.Win32.RegistryHive.CurrentUser;
+                return;
+            }
+            throw new IOException("slhwid: registry write failed");
         }
         foreach (var root in Roots())
         {

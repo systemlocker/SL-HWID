@@ -5,9 +5,9 @@ gather raw signals on a best-effort basis. The schema projection then decides
 which signals participate directly and which share a capped failure domain.
 Only projected slots affect the recovery threshold.
 
-## Current schema (v2)
+## Current schema (v3)
 
-Direct slots are `slstore`, `machine_guid`, `cpu_id`, `disk_serial`,
+Direct slots are `slstore`, `machine_guid`, `cpu_id`, `fixed_disk_serial`,
 `ram_total`, `volume_id`, `firmware`, `tpm_ek`, `memory_modules`,
 `nic_identity`, and `battery_serial`.
 
@@ -16,13 +16,45 @@ Grouped slots are:
 | Recovery slot          | Raw signals                                                      | Reason                                                                                        |
 | ---------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `platform_identity`    | `system_uuid`, `board_serial`, `system_serial`, `chassis_serial` | These often come from the same firmware tables and should not receive four independent votes. |
-| `display_group`        | `gpu_id`, `monitor_edid`                                         | GPUs, docks, and monitors are legitimate replacement or mobility events.                      |
+| `display_group`        | `gpu_id`, `edid_digests`                                         | GPUs, docks, and monitors are legitimate replacement or mobility events.                      |
 | `software_environment` | `computer_name`, `os_build`                                      | Renames and operating-system updates are correlated software changes.                         |
+
+`fixed_disk_serial` lists only non-removable disks, so plugging in a USB
+drive or SD card does not count as drift:
+
+- Windows: every physical disk except USB, SD, MMC, and mounted disk images
+  (storage bus types 7, 12, 13, and 15), read from the storage descriptor or
+  from `MSFT_PhysicalDisk`.
+- macOS: the internal NVMe and SATA buses reported by `system_profiler`.
+- Linux: block devices with a serial that are neither marked removable nor
+  attached through USB.
+
+`edid_digests` is derived from `monitor_edid` during normalization: one
+SHA-256 digest per monitor, sorted. Windows keeps the EDID of every monitor
+ever attached, so the full inventory regularly exceeded the 4096-byte factor
+limit and silently dropped out of schema v2; the digests stay small.
+
+### Earlier schemas
+
+Schema v2 is identical except that its direct disk slot is `disk_serial` (all
+physical disks, removable ones included) and its `display_group` hashes
+`gpu_id` and the full `monitor_edid` inventory. Schema v1 is the original
+ungrouped projection. Both remain readable: an existing helper recovers with
+its own schema, and `Commit` rewrites it in v3 around the same key, so the
+HWID does not change.
 
 A group is present when at least one member is present. Its value is a
 domain-separated SHA-256 digest over the group name and the complete,
 fixed-order member list, including empty members. Any member change changes
 the group, but the entire group can lose only one threshold vote.
+
+## Multi-instance values
+
+Signals with several instances (disks, memory modules, NICs, monitors, GPUs,
+firmware strings) use one canonical form in every implementation: each member
+is trimmed of ASCII whitespace, empty members are dropped, and the rest are
+sorted bytewise and joined with `|`. Never sort with a culture-aware
+comparer: the value would change with the user's language settings.
 
 ## Sanity filtering
 
@@ -86,7 +118,7 @@ To remove, rename, regroup, or reinterpret a signal:
 1. Do not alter an existing schema projection. Old helpers need exactly the
    slot names and values used when they were enrolled.
 2. Add a new schema version and retain the old projector and parser for the
-   promised migration window.
+   promised migration window (v3 did this for v2: see "Earlier schemas").
 3. Collect enough raw data to project both the old and new schemas.
 4. Recover with the helper's stored schema. Only after the application accepts
    the authentication should `Commit` project the current schema and rewrite
@@ -96,9 +128,9 @@ To remove, rename, regroup, or reinterpret a signal:
 6. Add tests proving old-helper recovery, no write before `Commit`, migration
    on `Commit`, unchanged HWID, and current-helper recovery afterward.
 
-Schema v1 support is intentionally retained for several releases. Its factor
-list is therefore historical compatibility code, not a list to clean up when
-the current schema changes.
+Schema v1 and v2 support is intentionally retained for several releases. Their
+factor lists are therefore historical compatibility code, not lists to clean
+up when the current schema changes.
 
 ## Collector guidance
 
@@ -112,7 +144,10 @@ Windows essentials use native operating-system APIs. `system_uuid` is the
 SMBIOS Type-1 UUID read through `GetSystemFirmwareTable`; it is not Windows'
 derived `ComputerHardwareId`. Do not introduce a WMIC dependency: the utility
 is absent on current Windows installations. CIM-based signals are optional,
-bounded enrichment and never overwrite a value obtained natively.
+bounded enrichment and never overwrite a value obtained natively. Permanent
+NIC addresses come from CIM: `Win32_NetworkAdapter` first (it is normally
+empty), then `MSFT_NetAdapter` adapters that have a physical connector and
+are not virtual.
 
 On Windows, TPM identity first uses the Platform Crypto Provider's `PCP_EKPUB`
 property. Its RSA public blob is encoded as ASN.1 `RSAPublicKey` and hashed with

@@ -7,7 +7,7 @@ using System.Text.RegularExpressions;
 
 namespace SLHwid;
 
-// §4A.1 factor collection per platform. The legacy slots reuse the shared
+// SL-HWID factor collection per platform. The legacy slots reuse the shared
 // composer's sources; the extended slots come from the registry,
 // environment, native calls and best-effort subprocess queries. Every source
 // degrades gracefully — a missing source just leaves the slot absent, which
@@ -35,8 +35,15 @@ internal static class SLHwidCollectors
         throw new NotSupportedException("slhwid: secret-sharing HWID is not supported on this platform");
     }
 
+    // Ordinal order matches the other implementations' byte-wise sort. The
+    // default comparer follows the current culture, so the joined value could
+    // change with the user's language settings.
+    // Each member is trimmed of ASCII whitespace first (the C++ rule), so
+    // padded firmware strings produce the same value in every implementation.
     private static string MultiInstance(IEnumerable<string> values) =>
-        string.Join("|", values.Where(v => v.Length > 0).Order());
+        string.Join("|", values.Select(v => v.Trim(AsciiWhitespace)).Where(v => v.Length > 0).Order(StringComparer.Ordinal));
+
+    private static readonly char[] AsciiWhitespace = [' ', '\t', '\n', '\v', '\f', '\r'];
 
     // ── Windows ────────────────────────────────────────────────────
 
@@ -60,9 +67,13 @@ internal static class SLHwidCollectors
             Registry(bios, "SystemBiosVersion") ?? "",
             Registry(bios, "BIOSVersion") ?? "",
         }));
+        // Registry() renders a DWORD as "0x<hex>". Strip only the prefix:
+        // TrimStart('0', 'x') also removed the digit of UBR 0, dropping the value.
         if (Registry(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber") is { } build
             && Registry(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "UBR") is { } ubr
-            && int.TryParse(ubr.TrimStart("0x".ToCharArray()), System.Globalization.NumberStyles.HexNumber, null, out var ubrValue))
+            && ubr.StartsWith("0x", StringComparison.Ordinal)
+            && uint.TryParse(ubr.AsSpan(2), System.Globalization.NumberStyles.AllowHexSpecifier,
+                System.Globalization.CultureInfo.InvariantCulture, out var ubrValue))
         {
             factors["os_build"] = $"{build}-{ubrValue}";
         }
@@ -70,7 +81,9 @@ internal static class SLHwidCollectors
         Put(factors, "gpu_id", MultiInstance(RegistrySubvalues(
             $@"SYSTEM\CurrentControlSet\Control\Class\{DisplayClassGuid}", "DriverDesc")));
         Put(factors, "monitor_edid", MultiInstance(RegistryEdidBlobs().Select(b => Convert.ToHexString(b).ToLowerInvariant())));
-        Put(factors, "disk_serial", MultiInstance(PhysicalDiskSerials()));
+        var disks = PhysicalDisks();
+        Put(factors, "disk_serial", MultiInstance(disks.Select(disk => disk.Serial)));
+        Put(factors, "fixed_disk_serial", MultiInstance(disks.Where(disk => IsFixedBus(disk.BusType)).Select(disk => disk.Serial)));
         Put(factors, "ram_total", RamTotal());
         Put(factors, "volume_id", VolumeSerial());
         Put(factors, "mac", MacAddress());
@@ -327,10 +340,15 @@ internal static class SLHwidCollectors
         return null;
     }
 
+    // Schema v3 fixed disks: everything except USB (7), SD (12), MMC (13) and
+    // mounted disk images (15, FileBackedVirtual). The values are Windows'
+    // STORAGE_BUS_TYPE, which MSFT_PhysicalDisk.BusType reports identically.
+    internal static bool IsFixedBus(uint busType) => busType is not (7 or 12 or 13 or 15);
+
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static IEnumerable<string> PhysicalDiskSerials()
+    private static List<(string Serial, uint BusType)> PhysicalDisks()
     {
-        var serials = new List<string>();
+        var serials = new List<(string Serial, uint BusType)>();
         var query = new byte[12]; // StorageDeviceProperty + PropertyStandardQuery
         for (var index = 0; index < 32; index++)
         {
@@ -361,7 +379,7 @@ internal static class SLHwidCollectors
                 var serial = ParseStorageSerial(descriptor, returned);
                 if (serial is not null)
                 {
-                    serials.Add(serial);
+                    serials.Add((serial, ParseStorageBusType(descriptor, returned)));
                 }
             }
             finally
@@ -371,6 +389,11 @@ internal static class SLHwidCollectors
         }
         return serials;
     }
+
+    // STORAGE_DEVICE_DESCRIPTOR.BusType sits at byte 28. The serial parser
+    // already requires the full 36-byte fixed header, so this read is in range.
+    internal static uint ParseStorageBusType(byte[] descriptor, uint returned) =>
+        returned >= 32 && descriptor.Length >= 32 ? BitConverter.ToUInt32(descriptor, 28) : 0;
 
     internal static string? ParseStorageSerial(byte[] descriptor, uint returned)
     {
@@ -421,8 +444,16 @@ internal static class SLHwidCollectors
             "$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;" +
             "Emit 'chassis_serial' (Get-CimInstance Win32_SystemEnclosure).SerialNumber;" +
             "Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;" +
+            // Schema v3 fixed disks; the bus values match IsFixedBus.
+            "Emit 'fixed_disk_serial' (Get-CimInstance -Namespace root/Microsoft/Windows/Storage MSFT_PhysicalDisk|?{$_.BusType -notin 7,12,13,15}).SerialNumber;" +
             "Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;" +
-            "Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress;" +
+            // Win32_NetworkAdapter.PermanentAddress is normally empty. It stays
+            // first so any value it did provide keeps its enrolled form;
+            // MSFT_NetAdapter supplies it otherwise. The script text must stay
+            // identical to the C++ collector.
+            "$n=@((Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress|?{$_});" +
+            "if($n.Count -eq 0){$n=(Get-CimInstance -Namespace root/StandardCimv2 MSFT_NetAdapter|?{$_.ConnectorPresent -and -not $_.Virtual}).PermanentAddress};" +
+            "Emit 'nic_identity' $n;" +
             "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;";
         // Both paths use the same fingerprint. A store created through the
         // PowerShell fallback automatically recovers natively when available.
@@ -432,7 +463,7 @@ internal static class SLHwidCollectors
                 "elseif($ek -is [string]){'tpm_status=PowerShell fallback: '+$ek}" +
                 "else{'tpm_status=PowerShell fallback: endorsement key unavailable.'}}catch{'tpm_status=PowerShell fallback: '+$_.Exception.Message}";
         var factors = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var line in Run("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 6)
+        foreach (var line in Run("powershell.exe", 6, "-NoProfile", "-NonInteractive", "-Command", script)
                      .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var separator = line.IndexOf('=');
@@ -477,17 +508,17 @@ internal static class SLHwidCollectors
     {
         var factors = new Dictionary<string, string>();
 
-        var expert = Run("ioreg", "-rd1 -c IOPlatformExpertDevice");
+        var expert = Run("ioreg", "-rd1", "-c", "IOPlatformExpertDevice");
         Put(factors, "machine_guid", FirstMatch(expert, "\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\""));
         Put(factors, "board_serial", FirstMatch(expert, "\"IOPlatformSerialNumber\"\\s*=\\s*\"([^\"]+)\""));
         Put(factors, "system_serial", FirstMatch(expert, "\"IOPlatformSerialNumber\"\\s*=\\s*\"([^\"]+)\""));
 
-        var brand = Run("sysctl", "-n machdep.cpu.brand_string").Trim();
+        var brand = Run("sysctl", "-n", "machdep.cpu.brand_string").Trim();
         if (brand.Length == 0)
         {
-            brand = Run("sysctl", "-n hw.model").Trim();
+            brand = Run("sysctl", "-n", "hw.model").Trim();
         }
-        var cores = Run("sysctl", "-n hw.physicalcpu").Trim();
+        var cores = Run("sysctl", "-n", "hw.physicalcpu").Trim();
         if (brand.Length > 0 && cores.Length > 0)
         {
             factors["cpu_id"] = $"{brand}-{cores}";
@@ -496,36 +527,42 @@ internal static class SLHwidCollectors
         Put(factors, "mac", FirstMatch(Run("ifconfig", "en0"), "ether\\s+([0-9a-fA-F:]{17})"));
         Put(factors, "nic_identity", MultiInstance(AllMatches(
             Run("networksetup", "-listallhardwareports"), "Ethernet Address:\\s*([0-9a-fA-F:]{17})")));
-        Put(factors, "ram_total", Run("sysctl", "-n hw.memsize").Trim());
-        Put(factors, "volume_id", FirstMatch(Run("diskutil", "info -plist /"), "<key>VolumeUUID</key>\\s*<string>([^<]+)</string>"));
-        Put(factors, "computer_name", NullIfEmpty(Run("scutil", "--get ComputerName").Trim()) ?? NullIfEmpty(Run("scutil", "--get LocalHostName").Trim()));
-        Put(factors, "firmware", FirstMatch(Run("system_profiler", "SPHardwareDataType -json", 5), "\"spmachine_bootrom_version\"\\s*:\\s*\"([^\"]+)\""));
+        Put(factors, "ram_total", Run("sysctl", "-n", "hw.memsize").Trim());
+        Put(factors, "volume_id", FirstMatch(Run("diskutil", "info", "-plist", "/"), "<key>VolumeUUID</key>\\s*<string>([^<]+)</string>"));
+        Put(factors, "computer_name", NullIfEmpty(Run("scutil", "--get", "ComputerName").Trim()) ?? NullIfEmpty(Run("scutil", "--get", "LocalHostName").Trim()));
+        Put(factors, "firmware", FirstMatch(Run("system_profiler", 5, "SPHardwareDataType", "-json"), "\"spmachine_bootrom_version\"\\s*:\\s*\"([^\"]+)\""));
         Put(factors, "memory_modules", MultiInstance(AllMatches(
-            Run("system_profiler", "SPMemoryDataType -json", 5), "\"[^\"]*serial[^\"]*\"\\s*:\\s*\"([^\"]+)\"")));
-        var battery = Run("ioreg", "-r -c AppleSmartBattery");
+            Run("system_profiler", 5, "SPMemoryDataType", "-json"), "\"[^\"]*serial[^\"]*\"\\s*:\\s*\"([^\"]+)\"")));
+        var battery = Run("ioreg", "-r", "-c", "AppleSmartBattery");
         Put(factors, "battery_serial",
             NullIfEmpty(FirstMatch(battery, "\"BatterySerialNumber\"\\s*=\\s*\"([^\"]+)\""))
             ?? NullIfEmpty(FirstMatch(battery, "\"Serial\"\\s*=\\s*\"?([^\"\\n]+)\"?")));
 
-        var displays = Run("system_profiler", "SPDisplaysDataType -json", 5);
+        var displays = Run("system_profiler", 5, "SPDisplaysDataType", "-json");
         var models = AllMatches(displays, "\"spdisplays_model\"\\s*:\\s*\"([^\"]+)\"");
         if (models.Count > 0)
         {
-            factors["gpu_id"] = string.Join("|", models.Order());
+            factors["gpu_id"] = MultiInstance(models);
         }
 
-        var storage = Run("system_profiler", "SPStorageDataType -json", 5);
+        var storage = Run("system_profiler", 5, "SPStorageDataType", "-json");
         var serials = AllMatches(storage, "\"[a-z_]*serial[a-z_]*\"\\s*:\\s*\"([^\"]+)\"");
         if (serials.Count > 0)
         {
-            factors["disk_serial"] = string.Join("|", serials.Order());
+            factors["disk_serial"] = MultiInstance(serials);
         }
 
-        var displayIo = Run("ioreg", "-r -c IODisplayConnect");
+        // Schema v3 fixed disks: only internal NVMe/SATA buses are listed here;
+        // USB storage appears under SPUSBDataType instead.
+        Put(factors, "fixed_disk_serial", MultiInstance(AllMatches(
+            Run("system_profiler", 5, "SPNVMeDataType", "SPSerialATADataType", "-json"),
+            "\"device_serial\"\\s*:\\s*\"([^\"]+)\"")));
+
+        var displayIo = Run("ioreg", "-r", "-c", "IODisplayConnect");
         var blobs = AllMatches(displayIo, "\"IODisplayEDID\"\\s*=\\s*<?([0-9a-fA-F]+)>?");
         if (blobs.Count > 0)
         {
-            factors["monitor_edid"] = string.Join("|", blobs.Select(b => b.ToLowerInvariant()).Order());
+            factors["monitor_edid"] = MultiInstance(blobs.Select(b => b.ToLowerInvariant()));
         }
 
         var version = Run("sw_vers", "-productVersion").Trim();
@@ -561,7 +598,7 @@ internal static class SLHwidCollectors
         Put(factors, "system_serial", ReadTextFile("/sys/class/dmi/id/product_serial"));
         Put(factors, "chassis_serial", ReadTextFile("/sys/class/dmi/id/chassis_serial"));
         Put(factors, "memory_modules", MultiInstance(AllMatches(
-            Run("dmidecode", "--type memory"), "(?m)^\\s*Serial Number:\\s*(\\S.*)$")));
+            Run("dmidecode", "--type", "memory"), "(?m)^\\s*Serial Number:\\s*(\\S.*)$")));
         var nicIds = new List<string>();
         try
         {
@@ -613,8 +650,19 @@ internal static class SLHwidCollectors
             }
         }
         Put(factors, "disk_serial", ReadTextFile("/sys/block/sda/device/serial"));
+        Put(factors, "fixed_disk_serial", MultiInstance(LinuxFixedDiskSerials()));
 
-        Put(factors, "computer_name", Environment.MachineName);
+        // Environment.MachineName drops everything after the first '.' on Unix.
+        // The other implementations use the full gethostname() value, which
+        // Dns.GetHostName returns unchanged.
+        try
+        {
+            Put(factors, "computer_name", System.Net.Dns.GetHostName());
+        }
+        catch
+        {
+            // absent
+        }
         try
         {
             var meminfo = File.ReadAllText("/proc/meminfo");
@@ -628,7 +676,7 @@ internal static class SLHwidCollectors
         {
             // absent
         }
-        Put(factors, "volume_id", NullIfEmpty(Run("findmnt", "-no UUID /").Trim()));
+        Put(factors, "volume_id", NullIfEmpty(Run("findmnt", "-no", "UUID", "/").Trim()));
         Put(factors, "firmware", ReadTextFile("/sys/class/dmi/id/bios_version"));
         try
         {
@@ -673,7 +721,7 @@ internal static class SLHwidCollectors
         }
         if (blobs.Count > 0)
         {
-            factors["monitor_edid"] = string.Join("|", blobs.Order());
+            factors["monitor_edid"] = MultiInstance(blobs);
         }
 
         var gpus = new List<string>();
@@ -704,10 +752,43 @@ internal static class SLHwidCollectors
         }
         if (gpus.Count > 0)
         {
-            factors["gpu_id"] = string.Join("|", gpus.Order());
+            factors["gpu_id"] = MultiInstance(gpus);
         }
 
         return factors;
+    }
+
+    // Schema v3 fixed disks on Linux: every block device with a serial that
+    // is neither marked removable nor attached through USB. NVMe/SCSI expose
+    // device/serial; virtio exposes serial on the block device itself.
+    private static IEnumerable<string> LinuxFixedDiskSerials()
+    {
+        var serials = new List<string>();
+        try
+        {
+            foreach (var block in Directory.GetDirectories("/sys/block").Order(StringComparer.Ordinal))
+            {
+                if (ReadTextFile(Path.Join(block, "removable")) == "1")
+                {
+                    continue;
+                }
+                var target = new DirectoryInfo(block).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? block;
+                if (target.Contains("/usb", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                var serial = ReadTextFile(Path.Join(block, "device", "serial")) ?? ReadTextFile(Path.Join(block, "serial"));
+                if (serial is not null)
+                {
+                    serials.Add(serial);
+                }
+            }
+        }
+        catch
+        {
+            // absent
+        }
+        return serials;
     }
 
     // ── shared helpers ─────────────────────────────────────────────
@@ -728,14 +809,97 @@ internal static class SLHwidCollectors
         }
     }
 
-    private static string Run(string fileName, string arguments, int timeoutSeconds = 4)
+    // Only OS-owned absolute paths are eligible. Process.Start otherwise checks
+    // the host executable directory and current directory before PATH on .NET 8.
+    internal static string? ResolveTrustedExecutable(string fileName)
+    {
+        string[] candidates;
+        if (OperatingSystem.IsWindows())
+        {
+            if (!fileName.Equals("powershell.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            candidates = new[]
+            {
+                Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
+            };
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            candidates = fileName switch
+            {
+                "ioreg" => new[] { "/usr/sbin/ioreg" },
+                "sysctl" => new[] { "/usr/sbin/sysctl" },
+                "ifconfig" => new[] { "/sbin/ifconfig" },
+                "networksetup" => new[] { "/usr/sbin/networksetup" },
+                "diskutil" => new[] { "/usr/sbin/diskutil" },
+                "scutil" => new[] { "/usr/sbin/scutil" },
+                "system_profiler" => new[] { "/usr/sbin/system_profiler" },
+                "sw_vers" => new[] { "/usr/bin/sw_vers" },
+                _ => Array.Empty<string>(),
+            };
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            candidates = fileName switch
+            {
+                "dmidecode" => new[] { "/usr/sbin/dmidecode", "/sbin/dmidecode" },
+                "findmnt" => new[] { "/usr/bin/findmnt", "/bin/findmnt" },
+                _ => Array.Empty<string>(),
+            };
+        }
+        else
+        {
+            return null;
+        }
+
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
+    private static void ConfigureTrustedEnvironment(ProcessStartInfo info, string executable)
+    {
+        info.Environment.Clear();
+        if (OperatingSystem.IsWindows())
+        {
+            var systemDirectory = Environment.SystemDirectory;
+            var windowsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (string.IsNullOrEmpty(windowsDirectory))
+            {
+                windowsDirectory = Directory.GetParent(systemDirectory)?.FullName ?? "C:\\Windows";
+            }
+            var powerShellHome = Path.GetDirectoryName(executable)!;
+            info.Environment["ComSpec"] = Path.Combine(systemDirectory, "cmd.exe");
+            info.Environment["PATH"] = string.Join(';', systemDirectory, windowsDirectory, powerShellHome);
+            info.Environment["PATHEXT"] = ".COM;.EXE;.BAT;.CMD";
+            info.Environment["PSModulePath"] = Path.Combine(powerShellHome, "Modules");
+            info.Environment["SystemDrive"] = Path.GetPathRoot(windowsDirectory)?.TrimEnd('\\') ?? "C:";
+            info.Environment["SystemRoot"] = windowsDirectory;
+            info.Environment["WINDIR"] = windowsDirectory;
+        }
+        else
+        {
+            info.Environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin";
+            info.Environment["LANG"] = "C";
+            info.Environment["LC_ALL"] = "C";
+        }
+    }
+
+    private static string Run(string fileName, params string[] arguments) =>
+        Run(fileName, 4, arguments);
+
+    private static string Run(string fileName, int timeoutSeconds, params string[] arguments)
     {
         try
         {
+            var executable = ResolveTrustedExecutable(fileName);
+            if (executable is null)
+            {
+                return "";
+            }
             var info = new ProcessStartInfo
             {
-                FileName = fileName,
-                Arguments = arguments,
+                FileName = executable,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -743,15 +907,21 @@ internal static class SLHwidCollectors
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
+            foreach (var argument in arguments)
+            {
+                info.ArgumentList.Add(argument);
+            }
+            ConfigureTrustedEnvironment(info, executable);
             using var process = Process.Start(info);
             if (process is null)
             {
                 return "";
             }
             var output = process.StandardOutput.ReadToEndAsync();
-            var errors = process.StandardError.ReadToEndAsync();
-            using var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-            if (!process.WaitForExit(timeoutSeconds * 1000))
+            var errors = process.StandardError.ReadToEndAsync(); // drained so the child never blocks on a full pipe
+            var timeout = TimeSpan.FromSeconds(timeoutSeconds);
+            var elapsed = Stopwatch.StartNew();
+            if (!process.WaitForExit(timeout))
             {
                 try
                 {
@@ -763,8 +933,16 @@ internal static class SLHwidCollectors
                 }
                 return "";
             }
-            errors.GetAwaiter().GetResult(); // drain diagnostics; collectors are deliberately best-effort
-            return output.GetAwaiter().GetResult();
+            // A helper process that inherited the pipes can hold them open
+            // after the direct child exits, so end-of-stream may never arrive.
+            // Bound that wait too, with a short grace period for buffered output.
+            var remaining = timeout - elapsed.Elapsed;
+            var grace = TimeSpan.FromMilliseconds(500);
+            if (!Task.WaitAll(new Task[] { output, errors }, remaining > grace ? remaining : grace))
+            {
+                return "";
+            }
+            return output.Result;
         }
         catch
         {

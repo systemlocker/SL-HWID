@@ -9,8 +9,8 @@
 // authorization. The module's own persisted value (slstore) is hard-locked:
 // changing or deleting it always requires re-activation.
 //
-// Storage formats are byte-compatible with the C# implementation. MIT
-// licensed; see the repository LICENSE.
+// Storage formats are byte-compatible with the C# implementation. Licensed
+// under the Elastic License 2.0 (modified); see the repository LICENSE.
 
 #include <memory>
 #include <optional>

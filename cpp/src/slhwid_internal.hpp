@@ -50,7 +50,8 @@ namespace slhwid::detail
     bool isMissing(const std::string &value);
     std::map<std::string, std::string> normalizeFactors(const std::map<std::string, std::string> &raw);
     constexpr std::uint8_t kLegacyNormVersion = 1;
-    constexpr std::uint8_t kCurrentNormVersion = 2;
+    constexpr std::uint8_t kV2NormVersion = 2;
+    constexpr std::uint8_t kCurrentNormVersion = 3;
     std::map<std::string, std::string> projectFactors(const std::map<std::string, std::string> &raw,
                                                       std::uint8_t normVersion);
     std::set<std::string> mapMandatoryToCurrent(const std::set<std::string> &names);
@@ -160,11 +161,21 @@ namespace slhwid::detail
     };
     RegistryRootSelection selectRegistryRoot(bool machineHelper, bool machineSlstore,
                                              bool userHelper, bool userSlstore);
+    // userMirrorsMachine: both hives hold the same store secret (see the
+    // registry store's per-user mirror).
+    RegistryRootSelection selectRegistryRoot(bool machineHelper, bool machineSlstore,
+                                             bool userHelper, bool userSlstore, bool userMirrorsMachine);
+    // Schema v3 fixed disks exclude USB (7), SD (12), MMC (13) and mounted
+    // images (15, FileBackedVirtual), as Windows' STORAGE_BUS_TYPE numbers them.
+    bool isFixedStorageBus(std::uint32_t busType);
+    std::uint32_t parseStorageDescriptorBusType(const std::vector<unsigned char> &descriptor, std::size_t returned);
     std::optional<std::string> parseRawSmbiosUuid(const std::vector<unsigned char> &raw);
     std::optional<std::string> parseStorageDescriptorSerial(
         const std::vector<unsigned char> &descriptor, std::size_t returned);
+    std::optional<std::string> parseOsReleasePrettyName(const std::string &content);
     bool acquireStorageLock(const std::string &directory, std::function<void()> &release, std::string &error);
     std::map<std::string, std::string> collectFactors(std::string &error);
+    std::optional<std::string> resolveTrustedCollectorExecutable(const std::string &tool);
     std::optional<std::string> nativeTpmFactor();
     void mergeWindowsFactors(std::map<std::string, std::string> &factors,
                              const std::map<std::string, std::string> &fallback);

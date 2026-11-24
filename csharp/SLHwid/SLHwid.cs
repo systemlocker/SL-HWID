@@ -195,11 +195,11 @@ public static class SLHwid
         {
             if (!rawFactors.ContainsKey("slstore"))
             {
-                rawFactors["slstore"] = EnsureSlstore(store, source);
+                rawFactors["slstore"] = EnsureSlstore(store, source, options.ForceReenroll);
             }
             var factors = SLHwidCore.ProjectFactors(rawFactors, SLHwidCore.CurrentNormVersion);
             var mandatory = SLHwidCore.MapMandatoryToCurrent(requestedMandatory);
-            foreach (var name in mandatory.Order())
+            foreach (var name in mandatory.Order(StringComparer.Ordinal))
             {
                 if (!factors.TryGetValue(name, out var value) || value.Length == 0)
                 {
@@ -270,15 +270,32 @@ public static class SLHwid
             result.Key!, new Draw(source), currentFactors, storedMandatory, store, existing);
     }
 
-    private static string EnsureSlstore(ISSStore store, Func<int, byte[]> source)
+    // Only called on the enrollment path (no helper, or ForceReenroll).
+    private static string EnsureSlstore(ISSStore store, Func<int, byte[]> source, bool forceReenroll)
     {
-        var existing = store.ReadSlstore();
-        if (existing is not null)
+        byte[]? existing;
+        try
         {
-            if (existing.Length != 32)
+            existing = store.ReadSlstore();
+        }
+        catch (SLHwidCorruptDataException) when (forceReenroll)
+        {
+            // A malformed secret is never replaced implicitly. An explicit
+            // ForceReenroll discards it with the rest of the device state;
+            // refusing that too would leave no recovery path short of
+            // deleting the store by hand.
+            existing = null;
+        }
+        if (existing is not null && existing.Length != 32)
+        {
+            if (!forceReenroll)
             {
                 throw new SLHwidCorruptDataException("slhwid: store secret has the wrong size");
             }
+            existing = null;
+        }
+        if (existing is not null)
+        {
             return Convert.ToHexString(existing).ToLowerInvariant();
         }
         var value = source(32);

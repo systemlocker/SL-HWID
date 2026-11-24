@@ -1,7 +1,7 @@
 # SL-HWID
 
 A fault-tolerant, cross-platform hardware fingerprint. SL-HWID combines
-independent over 14 signals, applying weighted shares to less stable values.
+over 14 independent signals, applying weighted shares to less stable values.
 Drifted slots are quietly re-absorbed after each successful use. The point
 is to prevent over-fitting to any single machine detail while avoiding
 over-dependence on the exact hardware configuration: routine changes such as
@@ -55,7 +55,17 @@ shared device identifier:
 ```csharp
 using SLHwid;
 
-var session = SLHwid.Prepare(new SLHwidOptions());
+SLHwidSession session;
+try
+{
+    // SLHwid is both the namespace and the class, so qualify the call.
+    session = SLHwid.SLHwid.Prepare(new SLHwidOptions());
+}
+catch (SLHwidDriftException error)
+{
+    Console.Error.WriteLine(error.Message);   // e.g. hardware drift past the threshold
+    return;
+}
 Console.WriteLine(session.Hwid);
 // ... after your server authorized this machine ...
 session.Commit();   // re-center tolerance on current hardware
@@ -66,7 +76,10 @@ session.Commit();   // re-center tolerance on current hardware
 This code relies on certain storage locations on the host machine.
 
 Windows: the registry (`HKLM\SOFTWARE\SystemLocker`, falling back to HKCU
-when the HKLM write is denied). macOS:
+when the HKLM write is denied). If an elevated run enrolled the device in
+HKLM, a later non-elevated run cannot update it; its `Commit` then keeps a
+per-user copy of the same enrollment in HKCU, with the same key and HWID, and
+later runs for that user use and refresh that copy. macOS:
 `~/Library/Application Support/SystemLocker`. Linux:
 `$XDG_DATA_HOME/systemlocker` (else `~/.local/share/systemlocker`). Pass
 `storePath` / `StorePath` to redirect storage to a directory.
@@ -96,9 +109,14 @@ changing mandatory slots affects every application that shares the store.
   migration waits until enough current slots exist.
 - Platform identifiers, display identifiers, and software-environment signals
   are grouped so each correlated set consumes only one recovery slot.
-- Existing schema-v1 helpers remain recoverable. After successful
-  authorization, `Commit` rewrites the helper with the current schema while
-  preserving the HWID.
+- Existing schema-v1 and schema-v2 helpers remain recoverable. After
+  successful authorization, `Commit` rewrites the helper with the current
+  schema (v3) while preserving the HWID.
+- Removable disks (USB, SD/MMC, mounted disk images) do not count toward the
+  disk slot, and each monitor contributes a fixed-size digest, so a long
+  monitor history no longer drops out of the display slot.
+- `ForceReenroll` / `forceReenroll` also replaces a damaged store secret.
+  Without it, a damaged secret is reported as corrupt data and left in place.
 - `ExtraMandatory` / `extraMandatory` also applies to an existing helper.
   An enrolled factor must still match before it can become mandatory. A
   newly available factor is bound when `Commit` succeeds after authorization.
@@ -110,12 +128,20 @@ changing mandatory slots affects every application that shares the store.
 Maintainers: see [Factor schema and migrations](FACTOR-SCHEMA.md) before
 adding, removing, renaming, regrouping, or changing a collected signal.
 
+## Security
+
+> [!WARNING]
+> Watch this repository (Watch → Custom → Releases) and update your
+> dependency when a release ships: releases regularly add security
+> enhancements.
+
+
 ## HOTFIX 2.0.1
 
 Here's what we changed:
 
 - The helper and its `SLStore` secret are always selected and written in the same hive, so an elevation change cannot pair values from different enrollments. If both hives contain complete enrollments, HKLM wins; use `ForceReenroll` to replace an intentionally abandoned generation.
 
-- Windows collection does not require WMIC. The SMBIOS UUID, stable disk and volume properties, and NIC identity come from native Windows APIs; PowerShell/CIM contributes optional signals under a bounded deadline and never replaces a native value.
+- Windows collection does not require WMIC. The SMBIOS UUID and stable disk and volume properties come from native Windows APIs; PowerShell/CIM contributes optional signals, including NIC identity, under a bounded deadline and never replaces a native value.
 
 - Factor normalization drops implausible values before enrollment, including byte-count mistakes for RAM, nil/example UUIDs, all-zero/all-`f` identifiers, malformed MACs, oversized values, and common firmware placeholders.

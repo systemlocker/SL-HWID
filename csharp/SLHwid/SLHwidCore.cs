@@ -3,7 +3,7 @@ using System.Text;
 
 namespace SLHwid;
 
-// Pure cryptographic core of the §4A secret-sharing HWID module:
+// Pure cryptographic core of the fault-tolerant secret-sharing HWID module:
 // GF(2^61-1) arithmetic on ulong, four-limb secret sharing, x-derivation,
 // helper-blob serialization, recovery and refresh. Platform-free; the
 // lifecycle in SLHwid wires it to collectors, storage and the
@@ -169,7 +169,8 @@ internal static class SLHwidCore
     private static readonly HashSet<string> IdentifierFactors = new(StringComparer.Ordinal)
     {
         "machine_guid", "product_uuid", "system_uuid", "board_serial", "system_serial", "chassis_serial",
-        "disk_serial", "volume_id", "tpm_ek", "memory_modules", "nic_identity", "battery_serial", "monitor_edid",
+        "disk_serial", "fixed_disk_serial", "volume_id", "tpm_ek", "memory_modules", "nic_identity", "battery_serial",
+        "monitor_edid",
     };
 
     public static string Normalize(string name, string raw)
@@ -266,11 +267,36 @@ internal static class SLHwidCore
                 output[name] = nv;
             }
         }
+        // Derived, never collected: a supplied value is always replaced.
+        output.Remove("edid_digests");
+        if (raw.TryGetValue("monitor_edid", out var edids)
+            && EdidDigests(Normalize("monitor_edid", edids)) is { Length: > 0 } digests
+            && IsSaneFactor("edid_digests", digests))
+        {
+            output["edid_digests"] = digests;
+        }
         return output;
     }
 
+    // Schema v3 replaces the full EDID inventory with one SHA-256 digest per
+    // monitor. Windows keeps the EDID of every monitor ever attached, and the
+    // hex inventory regularly exceeds the 4096-byte factor limit; the digests
+    // stay small. They are derived before that limit drops monitor_edid.
+    private static string EdidDigests(string normalized)
+    {
+        if (Encoding.UTF8.GetByteCount(normalized) > 1024 * 1024)
+        {
+            return ""; // bound the hashing work on untrusted input
+        }
+        return string.Join("|", normalized.Split('|')
+            .Where(part => !IsMissing(part) && !IsDegenerateIdentifier(part))
+            .Select(part => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(part))).ToLowerInvariant())
+            .Order(StringComparer.Ordinal));
+    }
+
     public const byte LegacyNormVersion = 1;
-    public const byte CurrentNormVersion = 2;
+    public const byte V2NormVersion = 2;
+    public const byte CurrentNormVersion = 3;
 
     private static readonly string[] LegacyFactorNames =
     [
@@ -278,18 +304,42 @@ internal static class SLHwidCore
         "ram_total", "volume_id", "computer_name", "firmware", "gpu_id", "monitor_edid", "os_build",
     ];
 
-    private static readonly string[] CurrentDirectFactorNames =
+    // Schema v2 is historical compatibility code: v2 helpers recover with it.
+    private static readonly string[] V2DirectFactorNames =
     [
         "slstore", "machine_guid", "cpu_id", "disk_serial", "ram_total", "volume_id", "firmware",
+        "tpm_ek", "memory_modules", "nic_identity", "battery_serial",
+    ];
+
+    private static readonly (string Name, string[] Members)[] V2FactorGroups =
+    [
+        ("platform_identity", ["system_uuid", "board_serial", "system_serial", "chassis_serial"]),
+        ("display_group", ["gpu_id", "monitor_edid"]),
+        ("software_environment", ["computer_name", "os_build"]),
+    ];
+
+    // Schema v3: fixed_disk_serial leaves out removable, USB and image-backed
+    // disks, and display_group uses per-monitor EDID digests.
+    private static readonly string[] CurrentDirectFactorNames =
+    [
+        "slstore", "machine_guid", "cpu_id", "fixed_disk_serial", "ram_total", "volume_id", "firmware",
         "tpm_ek", "memory_modules", "nic_identity", "battery_serial",
     ];
 
     private static readonly (string Name, string[] Members)[] CurrentFactorGroups =
     [
         ("platform_identity", ["system_uuid", "board_serial", "system_serial", "chassis_serial"]),
-        ("display_group", ["gpu_id", "monitor_edid"]),
+        ("display_group", ["gpu_id", "edid_digests"]),
         ("software_environment", ["computer_name", "os_build"]),
     ];
+
+    private static (string[] Direct, (string Name, string[] Members)[] Groups) Schema(byte normVersion) =>
+        normVersion switch
+        {
+            V2NormVersion => (V2DirectFactorNames, V2FactorGroups),
+            CurrentNormVersion => (CurrentDirectFactorNames, CurrentFactorGroups),
+            _ => throw new InvalidOperationException($"slhwid: unsupported factor schema {normVersion}"),
+        };
 
     // Factor-schema maintenance lives here. Collectors expose raw signals;
     // this function decides which signals become threshold slots. Add a direct
@@ -311,18 +361,15 @@ internal static class SLHwidCore
             }
             return output;
         }
-        if (normVersion != CurrentNormVersion)
-        {
-            throw new InvalidOperationException($"slhwid: unsupported factor schema {normVersion}");
-        }
-        foreach (var name in CurrentDirectFactorNames)
+        var (directNames, groups) = Schema(normVersion);
+        foreach (var name in directNames)
         {
             if (raw.TryGetValue(name, out var value) && value.Length > 0)
             {
                 output[name] = value;
             }
         }
-        foreach (var group in CurrentFactorGroups)
+        foreach (var group in groups)
         {
             var value = GroupValue(group.Name, group.Members, raw);
             if (value.Length > 0)
@@ -358,9 +405,10 @@ internal static class SLHwidCore
     public static string CurrentMandatoryName(string name) => name switch
     {
         "product_uuid" or "board_serial" or "system_uuid" or "system_serial" or "chassis_serial" => "platform_identity",
-        "gpu_id" or "monitor_edid" => "display_group",
+        "gpu_id" or "monitor_edid" or "edid_digests" => "display_group",
         "computer_name" or "os_build" => "software_environment",
         "mac" => "nic_identity",
+        "disk_serial" => "fixed_disk_serial",
         _ => name,
     };
 
@@ -376,8 +424,10 @@ internal static class SLHwidCore
         public bool Mandatory { get; } = mandatory;
     }
 
+    // Ordinal: the helper format requires byte order, and the default string
+    // comparer follows the current culture.
     public static List<SlotData> SlotList(Dictionary<string, string> factors, HashSet<string> mandatory) =>
-        factors.Keys.Order().Select(name => new SlotData(name, factors[name], mandatory.Contains(name))).ToList();
+        factors.Keys.Order(StringComparer.Ordinal).Select(name => new SlotData(name, factors[name], mandatory.Contains(name))).ToList();
 
     public sealed record ShareResult(Dictionary<string, ulong[]> Shares, byte Salt);
 
@@ -436,7 +486,8 @@ internal static class SLHwidCore
 
     public static byte[] SerializeHelper(Dictionary<string, ulong[]> shares, HashSet<string> mandatory, int t, byte salt, byte[] cw, byte normVersion = CurrentNormVersion)
     {
-        var names = shares.Keys.Order().ToArray();
+        // ParseHelper requires ordinal order; see SlotList.
+        var names = shares.Keys.Order(StringComparer.Ordinal).ToArray();
         using var payload = new MemoryStream();
         payload.WriteByte(1); // version
         payload.WriteByte(normVersion);
@@ -523,7 +574,7 @@ internal static class SLHwidCore
         {
             throw Corrupt($"unsupported version {body[0]}");
         }
-        if (body[1] is not LegacyNormVersion and not CurrentNormVersion)
+        if (body[1] is not LegacyNormVersion and not V2NormVersion and not CurrentNormVersion)
         {
             throw Corrupt($"unsupported factor schema {body[1]}");
         }
@@ -533,7 +584,7 @@ internal static class SLHwidCore
         }
         var allowedNames = body[1] == LegacyNormVersion
             ? LegacyFactorNames.ToHashSet(StringComparer.Ordinal)
-            : CurrentDirectFactorNames.Concat(CurrentFactorGroups.Select(g => g.Name)).ToHashSet(StringComparer.Ordinal);
+            : Schema(body[1]).Direct.Concat(Schema(body[1]).Groups.Select(g => g.Name)).ToHashSet(StringComparer.Ordinal);
         var n = body[3];
         var mandatoryHeader = body[4];
         var threshold = body[5];
